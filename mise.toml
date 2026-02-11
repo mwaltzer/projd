@@ -1,0 +1,53 @@
+[tools]
+rust = "stable"
+
+[env]
+MISE_AUTO_INSTALL = "1"
+
+[tasks.bootstrap]
+description = "Install or refresh mise + toolchain for this repo"
+run = "./scripts/bootstrap-mise.sh"
+
+[tasks.build]
+description = "Compile-check proj and projd (sandbox-safe)"
+run = "./scripts/cargo-safe.sh check --workspace"
+
+[tasks.test]
+description = "Compile-check tests (sandbox-safe)"
+run = "./scripts/cargo-safe.sh check --workspace --tests"
+
+[tasks.fmt]
+description = "Format code"
+run = "./scripts/cargo-safe.sh fmt --all"
+
+[tasks.clippy]
+description = "Lint code"
+run = "./scripts/cargo-safe.sh clippy --workspace --all-targets -- -D warnings"
+
+[tasks.daemon]
+description = "Run daemon in foreground"
+run = "./scripts/cargo-safe.sh run -p projd --"
+
+[tasks.ping]
+description = "Ping daemon (autostarts by default)"
+run = "./scripts/cargo-safe.sh run -p proj -- ping"
+
+[tasks.daemon-start]
+description = "Start daemon in background"
+run = "./scripts/cargo-safe.sh run -p proj -- daemon start"
+
+[tasks.daemon-stop]
+description = "Stop daemon"
+run = "./scripts/cargo-safe.sh run -p proj -- daemon stop"
+
+[tasks.daemon-status]
+description = "Show daemon status"
+run = "./scripts/cargo-safe.sh run -p proj -- daemon status"
+
+[tasks.build-link]
+description = "Full build with linker step (requires host toolchain)"
+run = "./scripts/cargo-safe.sh build --workspace"
+
+[tasks.test-run]
+description = "Run tests (requires host toolchain)"
+run = "./scripts/cargo-safe.sh test --workspace"
