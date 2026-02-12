@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use projd_types::{
-    default_socket_path, DownParams, ListResult, Request, Response, UpParams, UpResult,
-    METHOD_DOWN, METHOD_LIST, METHOD_PING, METHOD_SHUTDOWN, METHOD_UP,
+    default_socket_path, DownParams, ListResult, LogsParams, LogsResult, NameParams,
+    ProjectLifecycleState, ProjectStatus, Request, Response, StatusParams, StatusResult, UpParams,
+    UpResult, METHOD_DOWN, METHOD_LIST, METHOD_LOGS, METHOD_PEEK, METHOD_PING, METHOD_RESUME,
+    METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND, METHOD_SWITCH, METHOD_UP,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -26,6 +28,7 @@ struct Cli {
 enum Commands {
     Init,
     Up {
+        #[arg(value_name = "PATH_OR_NAME")]
         path: Option<PathBuf>,
         #[arg(long, default_value_t = true)]
         autostart: bool,
@@ -36,6 +39,37 @@ enum Commands {
         autostart: bool,
     },
     List {
+        #[arg(long, default_value_t = true)]
+        autostart: bool,
+    },
+    Switch {
+        name: String,
+        #[arg(long, default_value_t = true)]
+        autostart: bool,
+    },
+    Suspend {
+        name: String,
+        #[arg(long, default_value_t = true)]
+        autostart: bool,
+    },
+    Resume {
+        name: String,
+        #[arg(long, default_value_t = true)]
+        autostart: bool,
+    },
+    Peek {
+        name: String,
+        #[arg(long, default_value_t = true)]
+        autostart: bool,
+    },
+    Status {
+        name: Option<String>,
+        #[arg(long, default_value_t = true)]
+        autostart: bool,
+    },
+    Logs {
+        name: String,
+        process: Option<String>,
         #[arg(long, default_value_t = true)]
         autostart: bool,
     },
@@ -65,6 +99,16 @@ fn main() -> Result<()> {
         Commands::Up { path, autostart } => cmd_up(&socket_path, path, autostart),
         Commands::Down { name, autostart } => cmd_down(&socket_path, &name, autostart),
         Commands::List { autostart } => cmd_list(&socket_path, autostart),
+        Commands::Switch { name, autostart } => cmd_switch(&socket_path, &name, autostart),
+        Commands::Suspend { name, autostart } => cmd_suspend(&socket_path, &name, autostart),
+        Commands::Resume { name, autostart } => cmd_resume(&socket_path, &name, autostart),
+        Commands::Peek { name, autostart } => cmd_peek(&socket_path, &name, autostart),
+        Commands::Status { name, autostart } => cmd_status_projects(&socket_path, name, autostart),
+        Commands::Logs {
+            name,
+            process,
+            autostart,
+        } => cmd_logs(&socket_path, &name, process.as_deref(), autostart),
         Commands::Ping { autostart } => cmd_ping(&socket_path, autostart),
         Commands::Daemon { command } => match command {
             DaemonCommand::Start => cmd_start(&socket_path),
@@ -115,28 +159,16 @@ fn cmd_status(socket_path: &Path) -> Result<()> {
 fn cmd_init() -> Result<()> {
     let cwd = fs::canonicalize(std::env::current_dir().context("failed to resolve cwd")?)
         .context("failed to canonicalize cwd")?;
-    let toml_path = cwd.join(".project.toml");
-    if toml_path.exists() {
-        bail!("{} already exists", toml_path.display());
-    }
-
-    let default_name = cwd
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("project");
-    let content = format!(
-        "name = \"{name}\"\npath = \"{path}\"\n\n[server]\ncommand = \"cargo run\"\nport_env = \"PORT\"\ncwd = \".\"\n\n[browser]\nurls = [\"http://localhost:${{PORT}}\"]\n",
-        name = default_name,
-        path = cwd.to_string_lossy()
-    );
-    fs::write(&toml_path, content)
-        .with_context(|| format!("failed to write {}", toml_path.display()))?;
+    let toml_path = init_project_config(&cwd)?;
     println!("created {}", toml_path.display());
     Ok(())
 }
 
 fn cmd_up(socket_path: &Path, path: Option<PathBuf>, autostart: bool) -> Result<()> {
-    let project_dir = resolve_project_dir(path)?;
+    let project_dir = resolve_project_dir(socket_path, path, autostart)?;
+    if let Some(created) = ensure_project_config_exists(&project_dir)? {
+        println!("initialized {}", created.display());
+    }
     let params = UpParams {
         path: project_dir.to_string_lossy().to_string(),
     };
@@ -198,17 +230,283 @@ fn cmd_list(socket_path: &Path, autostart: bool) -> Result<()> {
     Ok(())
 }
 
-fn resolve_project_dir(path: Option<PathBuf>) -> Result<PathBuf> {
+fn cmd_switch(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
+    let status = request_name_status(socket_path, METHOD_SWITCH, name, autostart)?;
+    print_project_status(&status);
+    Ok(())
+}
+
+fn cmd_suspend(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
+    let status = request_name_status(socket_path, METHOD_SUSPEND, name, autostart)?;
+    print_project_status(&status);
+    Ok(())
+}
+
+fn cmd_resume(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
+    let status = request_name_status(socket_path, METHOD_RESUME, name, autostart)?;
+    print_project_status(&status);
+    Ok(())
+}
+
+fn cmd_peek(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
+    let status = request_name_status(socket_path, METHOD_PEEK, name, autostart)?;
+    print_project_status(&status);
+    Ok(())
+}
+
+fn cmd_status_projects(socket_path: &Path, name: Option<String>, autostart: bool) -> Result<()> {
+    let response = request_with_autostart(
+        socket_path,
+        METHOD_STATUS,
+        serde_json::to_value(StatusParams { name }).context("failed to serialize status params")?,
+        autostart,
+    )?;
+    let result: StatusResult = parse_ok_response(response)?;
+
+    if result.projects.is_empty() {
+        println!("no projects registered");
+        return Ok(());
+    }
+
+    for status in &result.projects {
+        print_project_status(status);
+    }
+
+    Ok(())
+}
+
+fn cmd_logs(socket_path: &Path, name: &str, process: Option<&str>, autostart: bool) -> Result<()> {
+    let response = request_with_autostart(
+        socket_path,
+        METHOD_LOGS,
+        serde_json::to_value(LogsParams {
+            name: name.to_string(),
+            process: process.map(ToString::to_string),
+        })
+        .context("failed to serialize logs params")?,
+        autostart,
+    )?;
+    let logs: LogsResult = parse_ok_response(response)?;
+    if logs.logs.is_empty() {
+        println!("no logs for {}", logs.project);
+        return Ok(());
+    }
+
+    for (index, item) in logs.logs.iter().enumerate() {
+        if logs.logs.len() > 1 {
+            if index > 0 {
+                println!();
+            }
+            println!("== {} ({}) ==", item.process, item.path);
+        }
+        print!("{}", item.content);
+        if !item.content.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+fn request_name_status(
+    socket_path: &Path,
+    method: &str,
+    name: &str,
+    autostart: bool,
+) -> Result<ProjectStatus> {
+    let response = request_with_autostart(
+        socket_path,
+        method,
+        serde_json::to_value(NameParams {
+            name: name.to_string(),
+        })
+        .context("failed to serialize command params")?,
+        autostart,
+    )?;
+
+    parse_ok_response(response)
+}
+
+fn print_project_status(status: &ProjectStatus) {
+    println!(
+        "{}\tstate={}\tfocused={}\tworkspace={}\tport={}\tpath={}",
+        status.project.name,
+        lifecycle_state_label(&status.state),
+        status.focused,
+        status.project.workspace,
+        status.project.port,
+        status.project.path
+    );
+}
+
+fn lifecycle_state_label(state: &ProjectLifecycleState) -> &'static str {
+    match state {
+        ProjectLifecycleState::Active => "active",
+        ProjectLifecycleState::Backgrounded => "backgrounded",
+        ProjectLifecycleState::Suspended => "suspended",
+    }
+}
+
+fn resolve_project_dir(
+    socket_path: &Path,
+    path: Option<PathBuf>,
+    autostart: bool,
+) -> Result<PathBuf> {
     let raw = match path {
         Some(path) => path,
-        None => std::env::current_dir().context("failed to read current directory")?,
+        None => {
+            let cwd = std::env::current_dir().context("failed to read current directory")?;
+            return canonicalize_existing_dir(&cwd);
+        }
     };
+
+    if raw.exists() {
+        return canonicalize_existing_dir(&raw);
+    }
+
+    if let Some(name) = path_name_target(&raw) {
+        if let Some(found) = try_find_project_path_by_name(socket_path, name, autostart) {
+            return canonicalize_existing_dir(&found);
+        }
+
+        if let Some(found) = resolve_name_in_project_roots(name) {
+            return Ok(found);
+        }
+
+        let roots = configured_project_roots();
+        if roots.is_empty() {
+            bail!("project '{name}' not found; provide a local project path");
+        }
+        let roots = roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("project '{name}' not found; tried registered projects and roots: {roots}");
+    }
+
     let canonical = fs::canonicalize(&raw)
         .with_context(|| format!("failed to resolve project path {}", raw.display()))?;
     if !canonical.is_dir() {
         bail!("project path is not a directory: {}", canonical.display());
     }
     Ok(canonical)
+}
+
+fn canonicalize_existing_dir(path: &Path) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve project path {}", path.display()))?;
+    if !canonical.is_dir() {
+        bail!("project path is not a directory: {}", canonical.display());
+    }
+    Ok(canonical)
+}
+
+fn path_name_target(path: &Path) -> Option<&str> {
+    if path.components().count() != 1 {
+        return None;
+    }
+    let name = path.to_str()?;
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    Some(name)
+}
+
+fn try_find_project_path_by_name(
+    socket_path: &Path,
+    name: &str,
+    autostart: bool,
+) -> Option<PathBuf> {
+    let response = request_with_autostart(socket_path, METHOD_LIST, Value::Null, autostart).ok()?;
+    let listed: ListResult = parse_ok_response(response).ok()?;
+    listed
+        .projects
+        .into_iter()
+        .find(|project| project.name == name)
+        .map(|project| PathBuf::from(project.path))
+}
+
+fn resolve_name_in_project_roots(name: &str) -> Option<PathBuf> {
+    for root in configured_project_roots() {
+        let candidate = root.join(name);
+        if candidate.is_dir() {
+            if let Ok(canonical) = fs::canonicalize(candidate) {
+                return Some(canonical);
+            }
+        }
+    }
+    None
+}
+
+fn configured_project_roots() -> Vec<PathBuf> {
+    if let Ok(raw) = std::env::var("PROJ_PROJECT_ROOTS") {
+        let roots: Vec<PathBuf> = raw
+            .split(':')
+            .filter_map(|item| {
+                let item = item.trim();
+                if item.is_empty() {
+                    None
+                } else {
+                    Some(expand_tilde_path(item))
+                }
+            })
+            .collect();
+        if !roots.is_empty() {
+            return roots;
+        }
+    }
+
+    std::env::var_os("HOME")
+        .map(|home| vec![PathBuf::from(home).join("Code")])
+        .unwrap_or_default()
+}
+
+fn expand_tilde_path(raw: &str) -> PathBuf {
+    if raw == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+
+    PathBuf::from(raw)
+}
+
+fn init_project_config(project_dir: &Path) -> Result<PathBuf> {
+    let toml_path = project_dir.join(".project.toml");
+    if toml_path.exists() {
+        bail!("{} already exists", toml_path.display());
+    }
+
+    let content = render_default_project_config(project_dir);
+    fs::write(&toml_path, content)
+        .with_context(|| format!("failed to write {}", toml_path.display()))?;
+    Ok(toml_path)
+}
+
+fn ensure_project_config_exists(project_dir: &Path) -> Result<Option<PathBuf>> {
+    let toml_path = project_dir.join(".project.toml");
+    if toml_path.exists() {
+        return Ok(None);
+    }
+    init_project_config(project_dir).map(Some)
+}
+
+fn render_default_project_config(project_dir: &Path) -> String {
+    let default_name = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project");
+    format!(
+        "name = \"{name}\"\npath = \"{path}\"\n\n[server]\ncommand = \"cargo run\"\nport_env = \"PORT\"\ncwd = \".\"\n\n[browser]\nurls = [\"http://localhost:${{PORT}}\"]\n",
+        name = default_name,
+        path = project_dir.to_string_lossy()
+    )
 }
 
 fn parse_ok_response<T: serde::de::DeserializeOwned>(response: Response) -> Result<T> {
@@ -317,6 +615,19 @@ fn start_daemon(socket_path: &Path) -> Result<()> {
     match spawn {
         Ok(_) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(local_projd) = detect_local_projd_binary() {
+                let local_spawn = Command::new(local_projd)
+                    .arg("--socket")
+                    .arg(socket_path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+                if local_spawn.is_ok() {
+                    return Ok(());
+                }
+            }
+
             Command::new("cargo")
                 .args(["run", "-q", "-p", "projd", "--", "--socket"])
                 .arg(socket_path)
@@ -328,5 +639,158 @@ fn start_daemon(socket_path: &Path) -> Result<()> {
             Ok(())
         }
         Err(err) => Err(err).context("failed to spawn projd"),
+    }
+}
+
+fn detect_local_projd_binary() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let mut candidates = Vec::new();
+
+    if let Some(bin_dir) = current_exe.parent() {
+        candidates.push(bin_dir.join(projd_binary_name()));
+        if let Some(debug_dir) = bin_dir.parent() {
+            candidates.push(debug_dir.join(projd_binary_name()));
+        }
+    }
+
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+#[cfg(unix)]
+fn projd_binary_name() -> &'static str {
+    "projd"
+}
+
+#[cfg(windows)]
+fn projd_binary_name() -> &'static str {
+    "projd.exe"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn path_name_target_accepts_single_relative_name() {
+        assert_eq!(path_name_target(Path::new("frontend")), Some("frontend"));
+        assert_eq!(path_name_target(Path::new(".")), None);
+        assert_eq!(path_name_target(Path::new("a/b")), None);
+    }
+
+    #[test]
+    fn configured_project_roots_prefers_env_var() {
+        let _guard = env_lock().lock().unwrap();
+        let root = unique_temp_dir("proj-roots-env");
+        fs::create_dir_all(&root).unwrap();
+        let alpha = root.join("alpha");
+        let beta = root.join("beta");
+        fs::create_dir_all(&alpha).unwrap();
+        fs::create_dir_all(&beta).unwrap();
+
+        let previous_roots = std::env::var_os("PROJ_PROJECT_ROOTS");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var(
+            "PROJ_PROJECT_ROOTS",
+            format!(" {}::{} ", alpha.display(), beta.display()),
+        );
+        std::env::set_var("HOME", "/tmp/ignored-home");
+
+        let roots = configured_project_roots();
+        assert_eq!(roots, vec![alpha, beta]);
+
+        restore_env("PROJ_PROJECT_ROOTS", previous_roots);
+        restore_env("HOME", previous_home);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn configured_project_roots_defaults_to_home_code() {
+        let _guard = env_lock().lock().unwrap();
+        let home = unique_temp_dir("proj-roots-home");
+        fs::create_dir_all(&home).unwrap();
+
+        let previous_roots = std::env::var_os("PROJ_PROJECT_ROOTS");
+        let previous_home = std::env::var_os("HOME");
+        std::env::remove_var("PROJ_PROJECT_ROOTS");
+        std::env::set_var("HOME", &home);
+
+        let roots = configured_project_roots();
+        assert_eq!(roots, vec![home.join("Code")]);
+
+        restore_env("PROJ_PROJECT_ROOTS", previous_roots);
+        restore_env("HOME", previous_home);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_name_in_project_roots_returns_canonical_match() {
+        let _guard = env_lock().lock().unwrap();
+        let root = unique_temp_dir("proj-resolve-name");
+        let project = root.join("frontend");
+        fs::create_dir_all(&project).unwrap();
+
+        let previous_roots = std::env::var_os("PROJ_PROJECT_ROOTS");
+        std::env::set_var("PROJ_PROJECT_ROOTS", root.to_string_lossy().to_string());
+
+        let found = resolve_name_in_project_roots("frontend");
+        assert_eq!(found, Some(fs::canonicalize(project).unwrap()));
+
+        restore_env("PROJ_PROJECT_ROOTS", previous_roots);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_project_config_exists_creates_default_toml() {
+        let dir = unique_temp_dir("proj-init-create");
+        fs::create_dir_all(&dir).unwrap();
+
+        let created = ensure_project_config_exists(&dir).unwrap();
+        assert!(created.is_some());
+
+        let toml_path = dir.join(".project.toml");
+        let content = fs::read_to_string(&toml_path).unwrap();
+        assert!(content.contains("name = \""));
+        assert!(content.contains("proj-init-create"));
+        assert!(content.contains("command = \"cargo run\""));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_project_config_exists_is_noop_when_present() {
+        let dir = unique_temp_dir("proj-init-existing");
+        fs::create_dir_all(&dir).unwrap();
+        let toml_path = dir.join(".project.toml");
+        fs::write(&toml_path, "name = \"demo\"\npath = \".\"\n").unwrap();
+
+        let created = ensure_project_config_exists(&dir).unwrap();
+        assert!(created.is_none());
+
+        let content = fs::read_to_string(&toml_path).unwrap();
+        assert_eq!(content, "name = \"demo\"\npath = \".\"\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("projd-proj-{label}-{nanos}"))
     }
 }
