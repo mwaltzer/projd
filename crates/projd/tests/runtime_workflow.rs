@@ -4,13 +4,15 @@ use projd_types::{
 };
 use serde_json::Value;
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct DaemonHarness {
     child: Child,
@@ -18,6 +20,7 @@ struct DaemonHarness {
     socket_path: PathBuf,
     state_path: PathBuf,
     niri_config_path: PathBuf,
+    router_port: u16,
 }
 
 impl DaemonHarness {
@@ -30,18 +33,22 @@ impl DaemonHarness {
         let socket_path = root_dir.join("projd.sock");
         let state_path = root_dir.join("state.json");
         let niri_config_path = root_dir.join("niri").join("config.kdl");
+        let router_port = allocate_router_port();
 
         fs::create_dir_all(niri_config_path.parent().expect("niri config parent path"))
             .expect("failed to create niri config directory");
         fs::write(&niri_config_path, "").expect("failed to seed niri config");
 
-        let child = spawn_projd(&socket_path, &state_path, &niri_config_path, env);
+        let mut daemon_env = env.to_vec();
+        daemon_env.push(("PROJD_ROUTER_PORT".to_string(), router_port.to_string()));
+        let child = spawn_projd(&socket_path, &state_path, &niri_config_path, &daemon_env);
         let harness = Self {
             child,
             root_dir,
             socket_path,
             state_path,
             niri_config_path,
+            router_port,
         };
         harness.wait_for_ping();
         harness
@@ -145,6 +152,10 @@ fn runtime_workflow_collects_logs_and_stops_processes() {
 
     let up_result: UpResult = serde_json::from_value(up_response.result.unwrap()).unwrap();
     assert_eq!(up_result.project.port, 3001);
+    assert_eq!(up_result.local_host, "runtime-demo.localhost");
+    assert!(up_result
+        .local_origin
+        .starts_with("http://runtime-demo.localhost:"));
 
     let server_log = harness
         .root_dir
@@ -426,6 +437,211 @@ urls = [\"http://localhost:${PORT}\"]\n",
     }
 }
 
+#[test]
+fn runtime_workflow_browser_launch_failure_does_not_block_up() {
+    let harness = DaemonHarness::start_with_env(&[(
+        "PROJD_BROWSER_CMD".to_string(),
+        "command-that-does-not-exist-for-projd-tests".to_string(),
+    )]);
+    let project_dir = harness.root_dir.join("project-browser-failure");
+    fs::create_dir_all(&project_dir).unwrap();
+    write_executable_script(
+        &project_dir.join("server.sh"),
+        "#!/usr/bin/env sh\n\
+echo \"server-boot\"\n\
+trap 'echo \"server-stop\"; exit 0' TERM INT\n\
+while true; do sleep 0.1; done\n",
+    );
+    fs::write(
+        project_dir.join(".project.toml"),
+        "name = \"browser-failure\"\n\
+path = \".\"\n\
+\n\
+[server]\n\
+command = \"sh ./server.sh\"\n\
+cwd = \".\"\n\
+\n\
+[browser]\n\
+urls = [\"http://localhost:${PORT}\"]\n",
+    )
+    .unwrap();
+
+    let up_response = request(
+        &harness.socket_path,
+        METHOD_UP,
+        serde_json::to_value(UpParams {
+            path: project_dir.to_string_lossy().to_string(),
+        })
+        .unwrap(),
+    )
+    .expect("up request failed");
+    assert!(up_response.ok, "up failed: {:?}", up_response.error);
+
+    let server_log = harness
+        .root_dir
+        .join("logs")
+        .join("browser-failure")
+        .join("server.log");
+    wait_for_log_contains(&server_log, "server-boot");
+
+    let list_response = request(&harness.socket_path, METHOD_LIST, Value::Null).unwrap();
+    assert!(list_response.ok);
+    let listed: ListResult = serde_json::from_value(list_response.result.unwrap()).unwrap();
+    assert_eq!(listed.projects.len(), 1);
+    assert_eq!(listed.projects[0].name, "browser-failure");
+
+    let down_response = request(
+        &harness.socket_path,
+        METHOD_DOWN,
+        serde_json::json!({"name":"browser-failure"}),
+    )
+    .unwrap();
+    assert!(down_response.ok);
+}
+
+#[test]
+fn runtime_workflow_routes_project_localhost_to_backend_port() {
+    let harness = DaemonHarness::start();
+    let project_dir = harness.root_dir.join("project-router");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(
+        project_dir.join(".project.toml"),
+        "name = \"router-demo\"\n\
+path = \".\"\n\
+\n\
+[browser]\n\
+urls = [\"${PROJ_ORIGIN}\"]\n",
+    )
+    .unwrap();
+
+    let up_response = request(
+        &harness.socket_path,
+        METHOD_UP,
+        serde_json::to_value(UpParams {
+            path: project_dir.to_string_lossy().to_string(),
+        })
+        .unwrap(),
+    )
+    .expect("up request failed");
+    assert!(up_response.ok, "up failed: {:?}", up_response.error);
+    let up_result: UpResult = serde_json::from_value(up_response.result.unwrap()).unwrap();
+    assert_eq!(up_result.local_host, "router-demo.localhost");
+    assert_eq!(
+        up_result.local_origin,
+        format!("http://router-demo.localhost:{}", harness.router_port)
+    );
+
+    let backend_port = up_result.project.port;
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let backend = thread::spawn(move || {
+        let listener = TcpListener::bind(("127.0.0.1", backend_port)).unwrap();
+        ready_tx.send(()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nrouter-works",
+            )
+            .unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let mut client = TcpStream::connect(("127.0.0.1", harness.router_port)).unwrap();
+    client
+        .write_all(
+            format!(
+                "GET /probe HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                up_result.local_host
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.contains("200 OK"));
+    assert!(response.contains("router-works"));
+    backend.join().unwrap();
+}
+
+#[test]
+fn runtime_workflow_router_returns_502_when_backend_missing() {
+    let harness = DaemonHarness::start();
+    let project_dir = harness.root_dir.join("project-router-missing-backend");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(
+        project_dir.join(".project.toml"),
+        "name = \"router-missing\"\n\
+path = \".\"\n",
+    )
+    .unwrap();
+
+    let up_response = request(
+        &harness.socket_path,
+        METHOD_UP,
+        serde_json::to_value(UpParams {
+            path: project_dir.to_string_lossy().to_string(),
+        })
+        .unwrap(),
+    )
+    .expect("up request failed");
+    assert!(up_response.ok, "up failed: {:?}", up_response.error);
+    let up_result: UpResult = serde_json::from_value(up_response.result.unwrap()).unwrap();
+
+    let mut client = TcpStream::connect(("127.0.0.1", harness.router_port)).unwrap();
+    client
+        .write_all(
+            format!(
+                "GET /probe HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                up_result.local_host
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.contains("502 Bad Gateway"));
+}
+
+#[test]
+fn runtime_workflow_second_start_does_not_unlink_active_socket() {
+    let harness = DaemonHarness::start();
+    let mut second = spawn_projd(
+        &harness.socket_path,
+        &harness.state_path,
+        &harness.niri_config_path,
+        &[(
+            "PROJD_ROUTER_PORT".to_string(),
+            harness.router_port.to_string(),
+        )],
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        match second.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = second.kill();
+                let _ = second.wait();
+                panic!("second daemon start did not fail within timeout");
+            }
+            Err(err) => panic!("failed to poll second daemon process: {err}"),
+        }
+    };
+    assert!(
+        !status.success(),
+        "second daemon start unexpectedly succeeded"
+    );
+
+    let ping_response = request(&harness.socket_path, METHOD_PING, Value::Null)
+        .expect("first daemon socket became unreachable after second start attempt");
+    assert!(
+        ping_response.ok,
+        "first daemon stopped responding after second start attempt"
+    );
+}
+
 fn write_executable_script(path: &Path, content: &str) {
     fs::write(path, content).expect("failed to write script");
     let mut perms = fs::metadata(path)
@@ -575,6 +791,11 @@ fn request(socket_path: &Path, method: &str, params: Value) -> Result<Response, 
 
     serde_json::from_str::<Response>(&line)
         .map_err(|err| format!("failed to parse daemon response JSON: {err}"))
+}
+
+fn allocate_router_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to allocate router port");
+    listener.local_addr().unwrap().port()
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

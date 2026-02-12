@@ -15,15 +15,21 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
+
+const DEFAULT_ROUTER_PORT: u16 = 48080;
+const ROUTER_HEADER_LIMIT_BYTES: usize = 64 * 1024;
+const ROUTER_MAX_CONCURRENT_STREAMS: usize = 256;
+const ROUTER_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(name = "projd", version, about = "Project daemon for proj CLI")]
@@ -34,6 +40,8 @@ struct Args {
     state: Option<PathBuf>,
     #[arg(long)]
     niri_config: Option<PathBuf>,
+    #[arg(long)]
+    router_port: Option<u16>,
 }
 
 fn main() -> Result<()> {
@@ -48,26 +56,42 @@ fn main() -> Result<()> {
         .niri_config
         .or_else(|| std::env::var_os("PROJD_NIRI_CONFIG").map(PathBuf::from))
         .unwrap_or_else(default_niri_config_path);
-    let mut app_state = AppState::load(state_path, niri_config_path)?;
+    let router_port = args
+        .router_port
+        .or_else(router_port_from_env)
+        .unwrap_or(DEFAULT_ROUTER_PORT);
+    let router_routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let mut app_state = AppState::load(
+        state_path,
+        niri_config_path,
+        router_port,
+        router_routes.clone(),
+    )?;
+    app_state.sync_router_routes()?;
 
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create socket directory: {}", parent.display()))?;
     }
 
-    if socket_path.exists() {
-        fs::remove_file(&socket_path)
-            .with_context(|| format!("failed to remove stale socket: {}", socket_path.display()))?;
-    }
+    let router_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), router_port);
+    let router_listener = TcpListener::bind(router_addr)
+        .with_context(|| format!("failed to bind router socket: {router_addr}"))?;
+    router_listener
+        .set_nonblocking(true)
+        .context("failed to set router listener as non-blocking")?;
 
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to bind socket: {}", socket_path.display()))?;
+    let listener = bind_daemon_socket(&socket_path)?;
     listener
         .set_nonblocking(true)
         .context("failed to set listener as non-blocking")?;
 
     info!("projd listening on {}", socket_path.display());
     let running = Arc::new(AtomicBool::new(true));
+    let router_running = running.clone();
+    let router_handle = thread::spawn(move || {
+        run_host_router(router_listener, router_routes, router_running, router_port)
+    });
 
     while running.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -89,6 +113,7 @@ fn main() -> Result<()> {
     if socket_path.exists() {
         let _ = fs::remove_file(&socket_path);
     }
+    let _ = router_handle.join();
     info!("projd shutdown complete");
     Ok(())
 }
@@ -101,6 +126,67 @@ fn init_logging() {
                 .unwrap_or_else(|_| "info".to_string()),
         )
         .try_init();
+}
+
+fn bind_daemon_socket(socket_path: &Path) -> Result<UnixListener> {
+    match UnixListener::bind(socket_path) {
+        Ok(listener) => Ok(listener),
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+            if daemon_is_reachable(socket_path) {
+                bail!(
+                    "failed to bind socket: {} (another projd instance is already running)",
+                    socket_path.display()
+                );
+            }
+            if socket_path.exists() {
+                fs::remove_file(socket_path).with_context(|| {
+                    format!("failed to remove stale socket: {}", socket_path.display())
+                })?;
+            }
+            UnixListener::bind(socket_path)
+                .with_context(|| format!("failed to bind socket: {}", socket_path.display()))
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to bind socket: {}", socket_path.display()))
+        }
+    }
+}
+
+fn daemon_is_reachable(socket_path: &Path) -> bool {
+    let stream = match UnixStream::connect(socket_path) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let mut writer = BufWriter::new(match stream.try_clone() {
+        Ok(clone) => clone,
+        Err(_) => return false,
+    });
+    let mut reader = BufReader::new(stream);
+    let ping = Request {
+        id: 0,
+        method: METHOD_PING.to_string(),
+        params: Value::Null,
+    };
+
+    if serde_json::to_writer(&mut writer, &ping).is_err() {
+        return false;
+    }
+    if writer.write_all(b"\n").is_err() || writer.flush().is_err() {
+        return false;
+    }
+
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+        return false;
+    }
+    serde_json::from_str::<Response>(&line)
+        .map(|response| response.ok)
+        .unwrap_or(false)
+}
+
+fn router_port_from_env() -> Option<u16> {
+    let raw = std::env::var("PROJD_ROUTER_PORT").ok()?;
+    raw.trim().parse::<u16>().ok()
 }
 
 fn handle_client(
@@ -147,6 +233,217 @@ fn write_response(writer: &mut BufWriter<UnixStream>, response: &Response) -> Re
     writer.write_all(b"\n").context("failed to write newline")?;
     writer.flush().context("failed to flush response")?;
     Ok(())
+}
+
+fn run_host_router(
+    listener: TcpListener,
+    routes: Arc<Mutex<BTreeMap<String, u16>>>,
+    running: Arc<AtomicBool>,
+    router_port: u16,
+) {
+    info!("projd host router listening on 127.0.0.1:{router_port}");
+    let active_streams = Arc::new(AtomicUsize::new(0));
+    while running.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let in_flight = active_streams.fetch_add(1, Ordering::SeqCst);
+                if in_flight >= ROUTER_MAX_CONCURRENT_STREAMS {
+                    active_streams.fetch_sub(1, Ordering::SeqCst);
+                    warn!(
+                        "router dropped incoming connection: too many active streams (limit={ROUTER_MAX_CONCURRENT_STREAMS})"
+                    );
+                    let _ =
+                        write_http_error(&mut stream, "503 Service Unavailable", "router is busy");
+                    continue;
+                }
+                let routes = routes.clone();
+                let active_streams = active_streams.clone();
+                thread::spawn(move || {
+                    let _guard = RouterStreamGuard::new(active_streams);
+                    if let Err(err) = handle_host_router_stream(stream, routes) {
+                        warn!("host router stream failed: {err:#}");
+                    }
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => {
+                warn!("host router accept error: {err}");
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+struct RouterStreamGuard {
+    active_streams: Arc<AtomicUsize>,
+}
+
+impl RouterStreamGuard {
+    fn new(active_streams: Arc<AtomicUsize>) -> Self {
+        Self { active_streams }
+    }
+}
+
+impl Drop for RouterStreamGuard {
+    fn drop(&mut self) {
+        self.active_streams.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn handle_host_router_stream(
+    mut client: TcpStream,
+    routes: Arc<Mutex<BTreeMap<String, u16>>>,
+) -> Result<()> {
+    client
+        .set_read_timeout(Some(ROUTER_HEADER_TIMEOUT))
+        .context("failed to configure router header timeout")?;
+    let initial = match read_http_head(&mut client) {
+        Ok(initial) => initial,
+        Err(err)
+            if caused_by_io_error_kind(&err, io::ErrorKind::TimedOut)
+                || caused_by_io_error_kind(&err, io::ErrorKind::WouldBlock) =>
+        {
+            write_http_error(
+                &mut client,
+                "408 Request Timeout",
+                "request header timed out",
+            )?;
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    client
+        .set_read_timeout(None)
+        .context("failed to clear router header timeout")?;
+    let Some(host) = extract_host_header(&initial) else {
+        write_http_error(&mut client, "400 Bad Request", "missing host header")?;
+        return Ok(());
+    };
+    let Some(route_key) = localhost_route_key_from_host(&host) else {
+        write_http_error(&mut client, "404 Not Found", "unknown project host route")?;
+        return Ok(());
+    };
+    let backend_port = {
+        let locked = routes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("router route table lock poisoned"))?;
+        locked.get(&route_key).copied()
+    };
+    let Some(backend_port) = backend_port else {
+        write_http_error(&mut client, "404 Not Found", "unknown project host route")?;
+        return Ok(());
+    };
+
+    let mut backend = match TcpStream::connect((Ipv4Addr::LOCALHOST, backend_port)) {
+        Ok(stream) => stream,
+        Err(err) => {
+            warn!(
+                "router backend connect failed for host '{}': 127.0.0.1:{} ({err})",
+                host, backend_port
+            );
+            write_http_error(&mut client, "502 Bad Gateway", "backend is not reachable")?;
+            return Ok(());
+        }
+    };
+    backend
+        .write_all(&initial)
+        .context("failed to write request preface to backend")?;
+
+    let mut client_reader = client
+        .try_clone()
+        .context("failed to clone client stream for request forwarding")?;
+    let mut backend_writer = backend
+        .try_clone()
+        .context("failed to clone backend stream for request forwarding")?;
+    let forward = thread::spawn(move || {
+        let copy_result = io::copy(&mut client_reader, &mut backend_writer);
+        let _ = backend_writer.shutdown(Shutdown::Write);
+        copy_result
+    });
+
+    io::copy(&mut backend, &mut client).context("failed to forward backend response")?;
+    let _ = client.shutdown(Shutdown::Write);
+
+    match forward.join() {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(err).context("failed to forward client request body to backend"),
+        Err(_) => bail!("host router forwarding thread panicked"),
+    }
+}
+
+fn caused_by_io_error_kind(err: &anyhow::Error, kind: io::ErrorKind) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io_err| io_err.kind() == kind)
+    })
+}
+
+fn read_http_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .context("failed to read client request")?;
+        if read == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..read]);
+        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(head);
+        }
+        if head.len() > ROUTER_HEADER_LIMIT_BYTES {
+            bail!("request header exceeds {} bytes", ROUTER_HEADER_LIMIT_BYTES);
+        }
+    }
+
+    if head.is_empty() {
+        bail!("empty request");
+    }
+    Ok(head)
+}
+
+fn write_http_error(stream: &mut TcpStream, status: &str, message: &str) -> Result<()> {
+    let body = format!("{message}\n");
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .context("failed to write router error response")
+}
+
+fn extract_host_header(request_head: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(request_head).ok()?;
+    text.split("\r\n")
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("host") {
+                Some(value.trim().to_ascii_lowercase())
+            } else {
+                None
+            }
+        })
+        .filter(|host| !host.is_empty())
+}
+
+fn localhost_route_key_from_host(host: &str) -> Option<String> {
+    let without_port = host
+        .split_once(':')
+        .map(|(left, _)| left)
+        .unwrap_or(host)
+        .trim_end_matches('.')
+        .trim()
+        .to_ascii_lowercase();
+    without_port
+        .strip_suffix(".localhost")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn handle_request(request: &Request, app_state: &mut AppState) -> (Response, bool) {
@@ -297,6 +594,9 @@ struct AppState {
     state_path: PathBuf,
     niri_config_path: PathBuf,
     logs_path: PathBuf,
+    browser_profile_root: PathBuf,
+    router_port: u16,
+    router_routes: Arc<Mutex<BTreeMap<String, u16>>>,
     runtime_processes: BTreeMap<String, Vec<RuntimeProcess>>,
 }
 
@@ -320,7 +620,9 @@ struct RuntimeConfig {
     agents: Vec<NamedCommandConfig>,
     terminals: Vec<NamedCommandConfig>,
     editor: Option<EditorRuntimeConfig>,
+    browser_command: Option<String>,
     browser_urls: Vec<String>,
+    browser_isolate_profile: bool,
     depends_on: Vec<DependencyTarget>,
 }
 
@@ -353,6 +655,12 @@ struct RuntimeSpawnSpec {
     env: Vec<(String, String)>,
 }
 
+#[derive(Debug, Default)]
+struct RuntimeStartOutcome {
+    started_processes: Vec<String>,
+    warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 enum DependencyTarget {
     Name(String),
@@ -360,7 +668,12 @@ enum DependencyTarget {
 }
 
 impl AppState {
-    fn load(state_path: PathBuf, niri_config_path: PathBuf) -> Result<Self> {
+    fn load(
+        state_path: PathBuf,
+        niri_config_path: PathBuf,
+        router_port: u16,
+        router_routes: Arc<Mutex<BTreeMap<String, u16>>>,
+    ) -> Result<Self> {
         let mut projects = BTreeMap::new();
         let mut focused_project: Option<String> = None;
         let mut suspended_projects = HashSet::new();
@@ -368,6 +681,16 @@ impl AppState {
             .parent()
             .map(|path| path.join("logs"))
             .unwrap_or_else(|| projd_types::default_data_dir().join("logs"));
+        let browser_profile_root = state_path
+            .parent()
+            .map(|path| path.join("browser-profiles"))
+            .unwrap_or_else(|| projd_types::default_data_dir().join("browser-profiles"));
+        fs::create_dir_all(&browser_profile_root).with_context(|| {
+            format!(
+                "failed to create browser profile root: {}",
+                browser_profile_root.display()
+            )
+        })?;
         if state_path.exists() {
             let raw = fs::read_to_string(&state_path)
                 .with_context(|| format!("failed to read state file: {}", state_path.display()))?;
@@ -413,6 +736,9 @@ impl AppState {
             state_path,
             niri_config_path,
             logs_path,
+            browser_profile_root,
+            router_port,
+            router_routes,
             runtime_processes: BTreeMap::new(),
         })
     }
@@ -450,22 +776,30 @@ impl AppState {
         resolving_paths: &mut HashSet<PathBuf>,
     ) -> Result<UpResult> {
         let project_cfg = load_project_config(&project_dir)?;
+        let project_name = project_cfg.name.clone();
         self.ensure_dependencies_for(&project_cfg, resolving_paths)?;
 
         let project_path = path_to_string(&project_cfg.path);
 
-        if let Some(existing) = self.projects.get(&project_cfg.name) {
+        if let Some(existing) = self.projects.get(&project_name) {
             if existing.path == project_path {
                 let existing = existing.clone();
-                self.ensure_runtime_for_project(&existing, &project_cfg)?;
+                let mut activation_warnings = Vec::new();
+                self.activate_project_in_niri(&existing, &mut activation_warnings);
+                let mut runtime = self.ensure_runtime_for_project(&existing, &project_cfg)?;
+                activation_warnings.append(&mut runtime.warnings);
                 return Ok(UpResult {
                     project: existing,
                     created: false,
+                    local_host: project_local_host(&project_name),
+                    local_origin: project_local_origin(&project_name, self.router_port),
+                    started_processes: runtime.started_processes,
+                    warnings: activation_warnings,
                 });
             }
             bail!(
                 "project '{}' is already registered with path {}",
-                project_cfg.name,
+                project_name,
                 existing.path
             );
         }
@@ -483,9 +817,9 @@ impl AppState {
         }
 
         let project = ProjectRecord {
-            name: project_cfg.name.clone(),
+            name: project_name.clone(),
             path: project_path,
-            workspace: project_cfg.name,
+            workspace: project_name.clone(),
             port: self.allocate_port()?,
         };
 
@@ -500,18 +834,30 @@ impl AppState {
             self.focused_project = previous_focus;
             return Err(err);
         }
-        if let Err(err) = self.start_runtime_for_project(&project, &project_cfg.runtime) {
-            self.projects = previous;
-            self.focused_project = previous_focus;
-            self.suspended_projects.remove(&project.name);
-            let _ = self.stop_runtime_for_project(&project.name);
-            let _ = self.sync();
-            return Err(err);
-        }
+        let mut activation_warnings = Vec::new();
+        self.activate_project_in_niri(&project, &mut activation_warnings);
+
+        let runtime = match self.start_runtime_for_project(&project, &project_cfg.runtime) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                self.projects = previous;
+                self.focused_project = previous_focus;
+                self.suspended_projects.remove(&project.name);
+                let _ = self.stop_runtime_for_project(&project.name);
+                let _ = self.sync();
+                return Err(err);
+            }
+        };
+        let mut runtime = runtime;
+        activation_warnings.append(&mut runtime.warnings);
 
         Ok(UpResult {
             project,
             created: true,
+            local_host: project_local_host(&project_name),
+            local_origin: project_local_origin(&project_name, self.router_port),
+            started_processes: runtime.started_processes,
+            warnings: activation_warnings,
         })
     }
 
@@ -749,14 +1095,19 @@ impl AppState {
         &mut self,
         project: &ProjectRecord,
         config: &LoadedProjectConfig,
-    ) -> Result<()> {
-        if self
-            .runtime_processes
-            .get(project.name.as_str())
-            .is_some_and(|processes| !processes.is_empty())
-        {
-            return Ok(());
+    ) -> Result<RuntimeStartOutcome> {
+        if let Some(processes) = self.runtime_processes.get(project.name.as_str()) {
+            if !processes.is_empty() {
+                return Ok(RuntimeStartOutcome {
+                    started_processes: processes
+                        .iter()
+                        .map(|process| process.name.clone())
+                        .collect(),
+                    warnings: Vec::new(),
+                });
+            }
         }
+
         self.start_runtime_for_project(project, &config.runtime)
     }
 
@@ -771,7 +1122,7 @@ impl AppState {
                     let project = self.project_by_name(name)?.clone();
                     let dependency_cfg = load_project_config(Path::new(&project.path))
                         .with_context(|| format!("failed to load dependency '{}' config", name))?;
-                    self.ensure_runtime_for_project(&project, &dependency_cfg)?;
+                    let _ = self.ensure_runtime_for_project(&project, &dependency_cfg)?;
                 }
                 DependencyTarget::Path(path) => {
                     if let Some(existing) = self
@@ -784,7 +1135,7 @@ impl AppState {
                             .with_context(|| {
                                 format!("failed to load dependency config at {}", path.display())
                             })?;
-                        self.ensure_runtime_for_project(&existing, &dependency_cfg)?;
+                        let _ = self.ensure_runtime_for_project(&existing, &dependency_cfg)?;
                     } else {
                         let _ = self.up_internal(
                             UpParams {
@@ -803,15 +1154,21 @@ impl AppState {
         &mut self,
         project: &ProjectRecord,
         config: &RuntimeConfig,
-    ) -> Result<()> {
-        let specs = build_runtime_spawn_specs(project, config)?;
+    ) -> Result<RuntimeStartOutcome> {
+        let specs = build_runtime_spawn_specs(
+            project,
+            config,
+            &self.browser_profile_root,
+            self.router_port,
+        )?;
         if specs.is_empty() {
             self.runtime_processes.remove(&project.name);
-            return Ok(());
+            return Ok(RuntimeStartOutcome::default());
         }
 
         let mut browser_specs = Vec::new();
         let mut non_browser_specs = Vec::new();
+        let mut warnings = Vec::new();
         for spec in specs {
             if is_browser_process_name(&spec.name) {
                 browser_specs.push(spec);
@@ -861,17 +1218,45 @@ impl AppState {
                 match self.spawn_runtime_process(project, spec) {
                     Ok(process) => started.push(process),
                     Err(err) => {
-                        for process in &mut started {
-                            let _ = terminate_child(&mut process.child, Duration::from_millis(500));
-                        }
-                        return Err(err);
+                        let message = err.to_string();
+                        warn!(
+                            "browser launch failed for project '{}': {message}",
+                            project.name
+                        );
+                        warnings.push(message);
                     }
                 }
             }
         }
 
+        let started_processes = started
+            .iter()
+            .map(|process| process.name.clone())
+            .collect::<Vec<_>>();
         self.runtime_processes.insert(project.name.clone(), started);
-        Ok(())
+        Ok(RuntimeStartOutcome {
+            started_processes,
+            warnings,
+        })
+    }
+
+    fn activate_project_in_niri(&mut self, project: &ProjectRecord, warnings: &mut Vec<String>) {
+        if let Err(err) = reload_niri_config_in_niri() {
+            warnings.push(format!("failed to reload niri config: {err}"));
+        }
+
+        if let Err(err) = focus_workspace_in_niri(&project.workspace) {
+            warnings.push(format!(
+                "failed to focus niri workspace '{}': {err}",
+                project.workspace
+            ));
+            return;
+        }
+
+        self.focused_project = Some(project.name.clone());
+        if let Err(err) = self.persist_state() {
+            warnings.push(format!("failed to persist focused project: {err}"));
+        }
     }
 
     fn spawn_runtime_process(
@@ -970,7 +1355,8 @@ impl AppState {
 
     fn sync(&self) -> Result<()> {
         self.write_niri_config()?;
-        self.persist_state()
+        self.persist_state()?;
+        self.sync_router_routes()
     }
 
     fn persist_state(&self) -> Result<()> {
@@ -1026,6 +1412,16 @@ impl AppState {
                 self.niri_config_path.display()
             )
         })?;
+        Ok(())
+    }
+
+    fn sync_router_routes(&self) -> Result<()> {
+        let routes = compute_router_routes(&self.projects)?;
+        let mut shared = self
+            .router_routes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("router route table lock poisoned"))?;
+        *shared = routes;
         Ok(())
     }
 }
@@ -1088,7 +1484,11 @@ struct RawEditorConfig {
 #[derive(Debug, Deserialize)]
 struct RawBrowserConfig {
     #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
     urls: Vec<String>,
+    #[serde(default = "default_true")]
+    isolate_profile: bool,
 }
 
 fn load_project_config(project_dir: &Path) -> Result<LoadedProjectConfig> {
@@ -1183,11 +1583,17 @@ fn build_runtime_config(parsed: &RawProjectConfig, project_path: &Path) -> Resul
     }
 
     if let Some(browser) = &parsed.browser {
+        runtime.browser_command = browser
+            .command
+            .as_deref()
+            .map(|value| non_empty_field(value, "browser.command"))
+            .transpose()?;
         runtime.browser_urls = browser
             .urls
             .iter()
             .map(|url| non_empty_field(url, "browser.urls[]"))
             .collect::<Result<Vec<_>>>()?;
+        runtime.browser_isolate_profile = browser.isolate_profile;
     }
 
     Ok(runtime)
@@ -1199,6 +1605,10 @@ fn non_empty_field(value: &str, field: &str) -> Result<String> {
         bail!("{field} cannot be empty");
     }
     Ok(trimmed.to_string())
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn resolve_runtime_cwd(raw: Option<&str>, project_path: &Path) -> Result<PathBuf> {
@@ -1255,16 +1665,80 @@ fn looks_like_path_dependency(raw: &str) -> bool {
         || raw.contains('/')
 }
 
+fn compute_router_routes(
+    projects: &BTreeMap<String, ProjectRecord>,
+) -> Result<BTreeMap<String, u16>> {
+    let mut routes = BTreeMap::new();
+    let mut owners = BTreeMap::new();
+    for project in projects.values() {
+        let route_key = project_local_route_key(&project.name);
+        if let Some(existing) = owners.get(&route_key) {
+            bail!(
+                "router host collision: projects '{}' and '{}' both map to '{}.localhost'",
+                existing,
+                project.name,
+                route_key
+            );
+        }
+        owners.insert(route_key.clone(), project.name.clone());
+        routes.insert(route_key, project.port);
+    }
+    Ok(routes)
+}
+
+fn project_local_route_key(project_name: &str) -> String {
+    let mut label = String::with_capacity(project_name.len());
+    for ch in project_name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            label.push(ch.to_ascii_lowercase());
+        } else {
+            label.push('-');
+        }
+    }
+    let label = label.trim_matches('-');
+    if label.is_empty() {
+        "project".to_string()
+    } else {
+        label.to_string()
+    }
+}
+
+fn project_local_host(project_name: &str) -> String {
+    format!("{}.localhost", project_local_route_key(project_name))
+}
+
+fn project_local_origin(project_name: &str, router_port: u16) -> String {
+    let host = project_local_host(project_name);
+    if router_port == 80 {
+        format!("http://{host}")
+    } else {
+        format!("http://{host}:{router_port}")
+    }
+}
+
 fn build_runtime_spawn_specs(
     project: &ProjectRecord,
     config: &RuntimeConfig,
+    browser_profile_root: &Path,
+    router_port: u16,
 ) -> Result<Vec<RuntimeSpawnSpec>> {
     let mut specs = Vec::new();
     let mut seen = HashSet::new();
-    let port_value = project.port.to_string();
+    let interpolation = RuntimeInterpolation::new(project, router_port);
+    let port_value = interpolation.port.to_string();
     let base_env = vec![
         ("PORT".to_string(), port_value.clone()),
         ("PROJ_NAME".to_string(), project.name.clone()),
+        ("PROJ_HOST".to_string(), interpolation.project_host.clone()),
+        (
+            "PROJ_ORIGIN".to_string(),
+            interpolation.project_origin.clone(),
+        ),
+        ("PROJ_URL".to_string(), interpolation.project_origin.clone()),
+        (
+            "PROJ_ROUTER_PORT".to_string(),
+            interpolation.router_port.to_string(),
+        ),
     ];
 
     if let Some(server) = &config.server {
@@ -1324,11 +1798,26 @@ fn build_runtime_spawn_specs(
     }
 
     for (index, url) in config.browser_urls.iter().enumerate() {
-        let command = format!(
-            "{} {}",
-            browser_open_command(),
-            quote_shell_arg(&interpolate_port(url, project.port))
+        let interpolated_url = interpolate_runtime_value(url, &interpolation);
+        let open_command = config
+            .browser_command
+            .as_deref()
+            .map(ToString::to_string)
+            .unwrap_or_else(browser_open_command);
+        let open_command = interpolate_runtime_value(&open_command, &interpolation);
+        let profile_dir = browser_profile_dir(browser_profile_root, &project.name);
+        let command = build_browser_launch_command(
+            &open_command,
+            &interpolated_url,
+            &profile_dir,
+            config.browser_isolate_profile,
         );
+        let env = browser_runtime_env(
+            &base_env,
+            &profile_dir,
+            &interpolated_url,
+            config.browser_isolate_profile,
+        )?;
         push_runtime_spec(
             &mut specs,
             &mut seen,
@@ -1336,7 +1825,7 @@ fn build_runtime_spawn_specs(
                 name: format!("browser-{}", index + 1),
                 command,
                 cwd: PathBuf::from(&project.path),
-                env: base_env.clone(),
+                env,
             },
         )?;
     }
@@ -1356,9 +1845,39 @@ fn push_runtime_spec(
     Ok(())
 }
 
-fn interpolate_port(value: &str, port: u16) -> String {
-    let replacement = port.to_string();
-    value.replace("${PORT}", &replacement)
+#[derive(Debug, Clone)]
+struct RuntimeInterpolation {
+    project_name: String,
+    port: u16,
+    router_port: u16,
+    project_host: String,
+    project_origin: String,
+}
+
+impl RuntimeInterpolation {
+    fn new(project: &ProjectRecord, router_port: u16) -> Self {
+        let project_host = project_local_host(&project.name);
+        let project_origin = project_local_origin(&project.name, router_port);
+        Self {
+            project_name: project.name.clone(),
+            port: project.port,
+            router_port,
+            project_host,
+            project_origin,
+        }
+    }
+}
+
+fn interpolate_runtime_value(value: &str, interpolation: &RuntimeInterpolation) -> String {
+    let port = interpolation.port.to_string();
+    let router_port = interpolation.router_port.to_string();
+    value
+        .replace("${PORT}", &port)
+        .replace("${PROJ_NAME}", &interpolation.project_name)
+        .replace("${PROJ_HOST}", &interpolation.project_host)
+        .replace("${PROJ_ORIGIN}", &interpolation.project_origin)
+        .replace("${PROJ_URL}", &interpolation.project_origin)
+        .replace("${PROJ_ROUTER_PORT}", &router_port)
 }
 
 fn build_shell_command_with_args(command: &str, args: &[String]) -> String {
@@ -1372,6 +1891,160 @@ fn build_shell_command_with_args(command: &str, args: &[String]) -> String {
 
 fn is_browser_process_name(name: &str) -> bool {
     name.starts_with("browser-")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserFamily {
+    Chromium,
+    Firefox,
+    Other,
+}
+
+fn browser_profile_dir(root: &Path, project_name: &str) -> PathBuf {
+    root.join(sanitize_log_component(project_name))
+}
+
+fn browser_runtime_env(
+    base_env: &[(String, String)],
+    profile_dir: &Path,
+    url: &str,
+    isolate_profile: bool,
+) -> Result<Vec<(String, String)>> {
+    let mut env = base_env.to_vec();
+    env.push((
+        "PROJ_BROWSER_PROFILE_DIR".to_string(),
+        profile_dir.display().to_string(),
+    ));
+    env.push(("PROJ_BROWSER_URL".to_string(), url.to_string()));
+    if isolate_profile {
+        let config_home = profile_dir.join("config");
+        let cache_home = profile_dir.join("cache");
+        let data_home = profile_dir.join("data");
+        fs::create_dir_all(&config_home).with_context(|| {
+            format!(
+                "failed to create browser XDG config dir: {}",
+                config_home.display()
+            )
+        })?;
+        fs::create_dir_all(&cache_home).with_context(|| {
+            format!(
+                "failed to create browser XDG cache dir: {}",
+                cache_home.display()
+            )
+        })?;
+        fs::create_dir_all(&data_home).with_context(|| {
+            format!(
+                "failed to create browser XDG data dir: {}",
+                data_home.display()
+            )
+        })?;
+        env.push((
+            "XDG_CONFIG_HOME".to_string(),
+            config_home.display().to_string(),
+        ));
+        env.push((
+            "XDG_CACHE_HOME".to_string(),
+            cache_home.display().to_string(),
+        ));
+        env.push(("XDG_DATA_HOME".to_string(), data_home.display().to_string()));
+    }
+
+    Ok(env)
+}
+
+fn build_browser_launch_command(
+    open_command: &str,
+    url: &str,
+    profile_dir: &Path,
+    isolate_profile: bool,
+) -> String {
+    let mut command = open_command.trim().to_string();
+    if isolate_profile {
+        let profile_dir = profile_dir.display().to_string();
+        match browser_family_for_command(&command) {
+            BrowserFamily::Chromium => {
+                if !command_has_flag(&command, "--new-window") {
+                    command.push_str(" --new-window");
+                }
+                if !command_has_flag(&command, "--new-instance") {
+                    command.push_str(" --new-instance");
+                }
+                if !command_has_flag_or_assigned_value(&command, "--user-data-dir") {
+                    command.push_str(" --user-data-dir=");
+                    command.push_str(&quote_shell_arg(&profile_dir));
+                }
+            }
+            BrowserFamily::Firefox => {
+                if !command_has_flag(&command, "--new-window") {
+                    command.push_str(" --new-window");
+                }
+                if !command_has_flag(&command, "--no-remote") {
+                    command.push_str(" --no-remote");
+                }
+                if !command_has_flag_or_assigned_value(&command, "--profile")
+                    && !command_has_flag_or_assigned_value(&command, "-profile")
+                    && !command_has_flag(&command, "-P")
+                {
+                    command.push_str(" --profile ");
+                    command.push_str(&quote_shell_arg(&profile_dir));
+                }
+            }
+            BrowserFamily::Other => {}
+        }
+    }
+
+    command.push(' ');
+    command.push_str(&quote_shell_arg(url));
+    command
+}
+
+fn browser_family_for_command(command: &str) -> BrowserFamily {
+    let Some(raw_executable) = command
+        .split_whitespace()
+        .next()
+        .map(|token| token.trim_matches(|ch| ch == '\'' || ch == '"'))
+    else {
+        return BrowserFamily::Other;
+    };
+    let Some(executable_name) = Path::new(raw_executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase())
+    else {
+        return BrowserFamily::Other;
+    };
+
+    if executable_name.contains("firefox")
+        || executable_name.contains("librewolf")
+        || executable_name.contains("waterfox")
+        || executable_name.contains("floorp")
+    {
+        return BrowserFamily::Firefox;
+    }
+
+    if executable_name.contains("chrom")
+        || executable_name.contains("chrome")
+        || executable_name.contains("brave")
+        || executable_name.contains("vivaldi")
+        || executable_name.contains("edge")
+        || executable_name.contains("helium")
+        || executable_name.contains("electron")
+    {
+        return BrowserFamily::Chromium;
+    }
+
+    BrowserFamily::Other
+}
+
+fn command_has_flag(command: &str, flag: &str) -> bool {
+    command.split_whitespace().any(|token| token == flag)
+}
+
+fn command_has_flag_or_assigned_value(command: &str, flag: &str) -> bool {
+    let assigned_prefix = format!("{flag}=");
+    command
+        .split_whitespace()
+        .any(|token| token == flag || token.starts_with(&assigned_prefix))
 }
 
 fn runtime_ready_timeout() -> Duration {
@@ -1487,14 +2160,18 @@ fn render_niri_fragment(projects: &BTreeMap<String, ProjectRecord>) -> String {
     let mut rendered = String::from("// generated by projd\n");
     for project in projects.values() {
         let workspace = escape_kdl_string(&project.workspace);
-        let title_tag = escape_kdl_string(&format!("[proj:{}]", project.name));
+        let title_pattern = escape_kdl_string(&project_title_match_pattern(&project.name));
         rendered.push_str(&format!("workspace \"{workspace}\"\n"));
         rendered.push_str("window-rule {\n");
-        rendered.push_str(&format!("  match title=\"{title_tag}\"\n"));
+        rendered.push_str(&format!("  match title=\"{title_pattern}\"\n"));
         rendered.push_str(&format!("  open-on-workspace \"{workspace}\"\n"));
         rendered.push_str("}\n");
     }
     rendered
+}
+
+fn project_title_match_pattern(project_name: &str) -> String {
+    format!(r"^\[proj:{}\]$", regex::escape(project_name))
 }
 
 fn escape_kdl_string(value: &str) -> String {
@@ -1684,6 +2361,25 @@ fn focus_workspace_in_niri(workspace: &str) -> Result<()> {
     bail!("niri focus command failed for workspace '{workspace}': {stderr}")
 }
 
+fn reload_niri_config_in_niri() -> Result<()> {
+    let output = Command::new("niri")
+        .arg("msg")
+        .arg("action")
+        .arg("load-config-file")
+        .output()
+        .context("failed to execute niri config reload command")?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        bail!("niri config reload command failed");
+    }
+
+    bail!("niri config reload command failed: {stderr}")
+}
+
 fn focused_workspace_from_niri() -> Option<String> {
     let output = Command::new("niri")
         .arg("msg")
@@ -1762,6 +2458,12 @@ mod tests {
     }
 
     #[test]
+    fn project_title_match_pattern_escapes_regex_specials() {
+        let pattern = project_title_match_pattern("context-systems.v2+alpha");
+        assert_eq!(pattern, r"^\[proj:context\-systems\.v2\+alpha\]$");
+    }
+
+    #[test]
     fn allocate_port_skips_existing_ports() {
         let mut projects = BTreeMap::new();
         projects.insert(
@@ -1780,6 +2482,9 @@ mod tests {
             state_path: PathBuf::from("/tmp/state.json"),
             niri_config_path: PathBuf::from("/tmp/config.kdl"),
             logs_path: PathBuf::from("/tmp/logs"),
+            browser_profile_root: PathBuf::from("/tmp/browser-profiles"),
+            router_port: DEFAULT_ROUTER_PORT,
+            router_routes: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_processes: BTreeMap::new(),
         };
         assert_eq!(state.allocate_port().unwrap(), 3002);
@@ -1820,6 +2525,9 @@ mod tests {
             state_path: PathBuf::from("/tmp/state.json"),
             niri_config_path: PathBuf::from("/tmp/config.kdl"),
             logs_path: PathBuf::from("/tmp/logs"),
+            browser_profile_root: PathBuf::from("/tmp/browser-profiles"),
+            router_port: DEFAULT_ROUTER_PORT,
+            router_routes: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_processes: BTreeMap::new(),
         };
 
@@ -1874,6 +2582,7 @@ args = [\".\"]\n\
 cwd = \".\"\n\
 \n\
 [browser]\n\
+command = \"helium\"\n\
 urls = [\"http://localhost:${PORT}\"]\n",
         )
         .unwrap();
@@ -1893,7 +2602,9 @@ urls = [\"http://localhost:${PORT}\"]\n",
         ));
         assert_eq!(runtime.agents.len(), 1);
         assert_eq!(runtime.editor.as_ref().unwrap().command, "code .");
+        assert_eq!(runtime.browser_command.as_deref(), Some("helium"));
         assert_eq!(runtime.browser_urls, vec!["http://localhost:${PORT}"]);
+        assert!(runtime.browser_isolate_profile);
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -1906,12 +2617,190 @@ urls = [\"http://localhost:${PORT}\"]\n",
     }
 
     #[test]
-    fn interpolate_port_replaces_placeholder_tokens() {
+    fn interpolate_runtime_value_replaces_port_placeholder_tokens() {
+        let project = ProjectRecord {
+            name: "demo".to_string(),
+            path: "/tmp/demo".to_string(),
+            workspace: "demo".to_string(),
+            port: 3210,
+        };
+        let interpolation = RuntimeInterpolation::new(&project, DEFAULT_ROUTER_PORT);
         assert_eq!(
-            interpolate_port("http://localhost:${PORT}/health", 3210),
+            interpolate_runtime_value("http://localhost:${PORT}/health", &interpolation),
             "http://localhost:3210/health"
         );
-        assert_eq!(interpolate_port("no-port", 3210), "no-port");
+        assert_eq!(
+            interpolate_runtime_value("no-port", &interpolation),
+            "no-port"
+        );
+    }
+
+    #[test]
+    fn project_local_origin_uses_router_port() {
+        assert_eq!(
+            project_local_host("Context Systems"),
+            "context-systems.localhost"
+        );
+        assert_eq!(
+            project_local_origin("Context Systems", 48080),
+            "http://context-systems.localhost:48080"
+        );
+        assert_eq!(
+            project_local_origin("Context Systems", 80),
+            "http://context-systems.localhost"
+        );
+    }
+
+    #[test]
+    fn interpolate_runtime_value_replaces_router_tokens() {
+        let project = ProjectRecord {
+            name: "frontend".to_string(),
+            path: "/tmp/frontend".to_string(),
+            workspace: "frontend".to_string(),
+            port: 3301,
+        };
+        let interpolation = RuntimeInterpolation::new(&project, 48080);
+        let rendered = interpolate_runtime_value(
+            "host=${PROJ_HOST} origin=${PROJ_ORIGIN} name=${PROJ_NAME} port=${PORT} router=${PROJ_ROUTER_PORT}",
+            &interpolation,
+        );
+        assert_eq!(
+            rendered,
+            "host=frontend.localhost origin=http://frontend.localhost:48080 name=frontend port=3301 router=48080"
+        );
+    }
+
+    #[test]
+    fn localhost_route_key_from_host_parses_localhost_hosts() {
+        assert_eq!(
+            localhost_route_key_from_host("frontend.localhost:48080"),
+            Some("frontend".to_string())
+        );
+        assert_eq!(
+            localhost_route_key_from_host("frontend.localhost."),
+            Some("frontend".to_string())
+        );
+        assert_eq!(localhost_route_key_from_host("localhost"), None);
+    }
+
+    #[test]
+    fn compute_router_routes_rejects_colliding_project_names() {
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "foo-bar".to_string(),
+            ProjectRecord {
+                name: "foo-bar".to_string(),
+                path: "/tmp/foo-bar".to_string(),
+                workspace: "foo-bar".to_string(),
+                port: 3001,
+            },
+        );
+        projects.insert(
+            "foo_bar".to_string(),
+            ProjectRecord {
+                name: "foo_bar".to_string(),
+                path: "/tmp/foo_bar".to_string(),
+                workspace: "foo_bar".to_string(),
+                port: 3002,
+            },
+        );
+        let err = compute_router_routes(&projects).unwrap_err();
+        assert!(err.to_string().contains("router host collision"));
+    }
+
+    #[test]
+    fn build_runtime_spawn_specs_prefers_project_browser_command() {
+        let project = ProjectRecord {
+            name: "demo".to_string(),
+            path: "/tmp/demo".to_string(),
+            workspace: "demo".to_string(),
+            port: 3001,
+        };
+        let config = RuntimeConfig {
+            browser_command: Some("helium".to_string()),
+            browser_urls: vec!["http://localhost:${PORT}".to_string()],
+            browser_isolate_profile: true,
+            ..RuntimeConfig::default()
+        };
+
+        let specs = build_runtime_spawn_specs(
+            &project,
+            &config,
+            Path::new("/tmp/browser-profiles"),
+            DEFAULT_ROUTER_PORT,
+        )
+        .unwrap();
+        let browser = specs
+            .iter()
+            .find(|spec| spec.name == "browser-1")
+            .expect("missing browser spawn spec");
+        assert!(browser.command.contains("helium"));
+        assert!(browser.command.contains("--new-window"));
+        assert!(browser.command.contains("--new-instance"));
+        assert!(browser.command.contains("--user-data-dir="));
+        assert!(browser.command.contains("http://localhost:3001"));
+        assert!(browser
+            .env
+            .iter()
+            .any(|(key, _)| key == "PROJ_BROWSER_PROFILE_DIR"));
+        assert!(browser
+            .env
+            .iter()
+            .any(|(key, value)| key == "PROJ_BROWSER_URL" && value == "http://localhost:3001"));
+        assert!(browser.env.iter().any(|(key, _)| key == "XDG_CONFIG_HOME"));
+        assert!(browser.env.iter().any(|(key, _)| key == "XDG_CACHE_HOME"));
+        assert!(browser.env.iter().any(|(key, _)| key == "XDG_DATA_HOME"));
+    }
+
+    #[test]
+    fn build_runtime_spawn_specs_respects_browser_isolation_opt_out() {
+        let project = ProjectRecord {
+            name: "demo".to_string(),
+            path: "/tmp/demo".to_string(),
+            workspace: "demo".to_string(),
+            port: 3001,
+        };
+        let config = RuntimeConfig {
+            browser_command: Some("helium".to_string()),
+            browser_urls: vec!["http://localhost:${PORT}".to_string()],
+            browser_isolate_profile: false,
+            ..RuntimeConfig::default()
+        };
+
+        let specs = build_runtime_spawn_specs(
+            &project,
+            &config,
+            Path::new("/tmp/browser-profiles"),
+            DEFAULT_ROUTER_PORT,
+        )
+        .unwrap();
+        let browser = specs
+            .iter()
+            .find(|spec| spec.name == "browser-1")
+            .expect("missing browser spawn spec");
+        assert_eq!(browser.command, "helium http://localhost:3001");
+        assert!(!browser.env.iter().any(|(key, _)| key == "XDG_CONFIG_HOME"));
+        assert!(!browser.env.iter().any(|(key, _)| key == "XDG_CACHE_HOME"));
+        assert!(!browser.env.iter().any(|(key, _)| key == "XDG_DATA_HOME"));
+    }
+
+    #[test]
+    fn build_browser_launch_command_adds_firefox_isolation_flags() {
+        let profile_dir = PathBuf::from("/tmp/projd-browser-profile");
+        let command =
+            build_browser_launch_command("firefox", "http://localhost:3001", &profile_dir, true);
+        assert!(command.contains("--new-window"));
+        assert!(command.contains("--no-remote"));
+        assert!(command.contains("--profile"));
+        assert!(command.contains("http://localhost:3001"));
+    }
+
+    #[test]
+    fn build_browser_launch_command_keeps_other_commands_unchanged() {
+        let profile_dir = PathBuf::from("/tmp/projd-browser-profile");
+        let command =
+            build_browser_launch_command("xdg-open", "http://localhost:3001", &profile_dir, true);
+        assert_eq!(command, "xdg-open http://localhost:3001");
     }
 
     #[test]
@@ -1958,7 +2847,13 @@ urls = [\"http://localhost:${PORT}\"]\n",
         };
         fs::write(&state_path, serde_json::to_string(&persisted).unwrap()).unwrap();
 
-        let loaded = AppState::load(state_path, niri_config_path).unwrap();
+        let loaded = AppState::load(
+            state_path,
+            niri_config_path,
+            DEFAULT_ROUTER_PORT,
+            Arc::new(Mutex::new(BTreeMap::new())),
+        )
+        .unwrap();
         assert_eq!(loaded.focused_project.as_deref(), Some("api"));
         assert!(loaded.suspended_projects.contains("frontend"));
         assert!(!loaded.suspended_projects.contains("missing"));
@@ -1992,7 +2887,13 @@ urls = [\"http://localhost:${PORT}\"]\n",
         };
         fs::write(&state_path, serde_json::to_string(&persisted).unwrap()).unwrap();
 
-        let loaded = AppState::load(state_path, niri_config_path).unwrap();
+        let loaded = AppState::load(
+            state_path,
+            niri_config_path,
+            DEFAULT_ROUTER_PORT,
+            Arc::new(Mutex::new(BTreeMap::new())),
+        )
+        .unwrap();
         assert_eq!(loaded.focused_project.as_deref(), Some("b"));
 
         let _ = fs::remove_dir_all(&base);
@@ -2035,6 +2936,9 @@ urls = [\"http://localhost:${PORT}\"]\n",
             state_path: state_path.clone(),
             niri_config_path,
             logs_path: base.join("logs"),
+            browser_profile_root: base.join("browser-profiles"),
+            router_port: DEFAULT_ROUTER_PORT,
+            router_routes: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_processes: BTreeMap::new(),
         };
         state.persist_state().unwrap();

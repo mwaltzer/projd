@@ -95,6 +95,14 @@ pub struct ProjectRecord {
 pub struct UpResult {
     pub project: ProjectRecord,
     pub created: bool,
+    #[serde(default)]
+    pub local_host: String,
+    #[serde(default)]
+    pub local_origin: String,
+    #[serde(default)]
+    pub started_processes: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

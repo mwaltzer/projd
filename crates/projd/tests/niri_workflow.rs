@@ -7,6 +7,7 @@ use projd_types::{
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -27,12 +28,13 @@ impl DaemonHarness {
         let socket_path = root_dir.join("projd.sock");
         let state_path = root_dir.join("state.json");
         let niri_config_path = root_dir.join("niri").join("config.kdl");
+        let router_port = allocate_router_port();
 
         fs::create_dir_all(niri_config_path.parent().expect("niri config parent path"))
             .expect("failed to create niri config directory");
         fs::write(&niri_config_path, initial_niri_config).expect("failed to seed niri config");
 
-        let child = spawn_projd(&socket_path, &state_path, &niri_config_path);
+        let child = spawn_projd(&socket_path, &state_path, &niri_config_path, router_port);
 
         let harness = Self {
             child,
@@ -67,7 +69,12 @@ impl DaemonHarness {
     }
 }
 
-fn spawn_projd(socket_path: &Path, state_path: &Path, niri_config_path: &Path) -> Child {
+fn spawn_projd(
+    socket_path: &Path,
+    state_path: &Path,
+    niri_config_path: &Path,
+    router_port: u16,
+) -> Child {
     if let Some(projd_bin) = detect_projd_binary() {
         return Command::new(projd_bin)
             .arg("--socket")
@@ -76,6 +83,7 @@ fn spawn_projd(socket_path: &Path, state_path: &Path, niri_config_path: &Path) -
             .arg(state_path)
             .arg("--niri-config")
             .arg(niri_config_path)
+            .env("PROJD_ROUTER_PORT", router_port.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -101,6 +109,7 @@ fn spawn_projd(socket_path: &Path, state_path: &Path, niri_config_path: &Path) -
         .arg(state_path)
         .arg("--niri-config")
         .arg(niri_config_path)
+        .env("PROJD_ROUTER_PORT", router_port.to_string())
         .current_dir(workspace_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -195,6 +204,10 @@ fn niri_workflow_up_down_round_trip_updates_managed_section() {
     assert_eq!(up_result.project.name, "frontend");
     assert_eq!(up_result.project.workspace, "frontend");
     assert_eq!(up_result.project.port, 3001);
+    assert_eq!(up_result.local_host, "frontend.localhost");
+    assert!(up_result
+        .local_origin
+        .starts_with("http://frontend.localhost:"));
 
     let status_response = request(
         &harness.socket_path,
@@ -219,7 +232,7 @@ fn niri_workflow_up_down_round_trip_updates_managed_section() {
     assert!(niri_after_up.contains(NIRI_MANAGED_END));
     assert!(niri_after_up.contains("workspace \"frontend\""));
     assert!(niri_after_up.contains("open-on-workspace \"frontend\""));
-    assert!(niri_after_up.contains("[proj:frontend]"));
+    assert!(niri_after_up.contains(r#"match title="^\\[proj:frontend\\]$""#));
 
     let down_response = request(
         &harness.socket_path,
@@ -237,7 +250,7 @@ fn niri_workflow_up_down_round_trip_updates_managed_section() {
     assert!(niri_after_down.contains("workspace \"personal\""));
     assert!(niri_after_down.contains(NIRI_MANAGED_START));
     assert!(niri_after_down.contains(NIRI_MANAGED_END));
-    assert!(!niri_after_down.contains("[proj:frontend]"));
+    assert!(!niri_after_down.contains(r#"match title="^\\[proj:frontend\\]$""#));
     assert!(!niri_after_down.contains("open-on-workspace \"frontend\""));
 
     let list_response = request(&harness.socket_path, METHOD_LIST, Value::Null).unwrap();
@@ -361,6 +374,11 @@ fn request(socket_path: &Path, method: &str, params: Value) -> Result<Response, 
 
     serde_json::from_str::<Response>(&line)
         .map_err(|err| format!("failed to parse daemon response JSON: {err}"))
+}
+
+fn allocate_router_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to allocate router port");
+    listener.local_addr().unwrap().port()
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {
