@@ -5,12 +5,12 @@ rust = "stable"
 MISE_AUTO_INSTALL = "1"
 
 [tasks.bootstrap]
-description = "Install/refresh mise + toolchain and local proj/projd CLI binaries"
+description = "Install/refresh mise + toolchain and local proj/projd/proj-tui binaries"
 run = "./scripts/bootstrap-mise.sh"
 
 [tasks.install-cli]
-description = "Install proj/projd into ~/.cargo/bin"
-run = "CARGO_NET_OFFLINE=false ./scripts/cargo-safe.sh install --path crates/proj --force && CARGO_NET_OFFLINE=false ./scripts/cargo-safe.sh install --path crates/projd --force"
+description = "Install proj/projd/proj-tui into ~/.cargo/bin"
+run = "CARGO_NET_OFFLINE=false ./scripts/cargo-safe.sh install --path crates/proj --force && CARGO_NET_OFFLINE=false ./scripts/cargo-safe.sh install --path crates/projd --force && CARGO_NET_OFFLINE=false ./scripts/cargo-safe.sh install --path crates/proj-tui --force"
 
 [tasks.build]
 description = "Compile-check proj and projd (sandbox-safe)"
@@ -35,6 +35,10 @@ run = "./scripts/cargo-safe.sh run -p projd --"
 [tasks.ping]
 description = "Ping daemon (autostarts by default)"
 run = "./scripts/cargo-safe.sh run -p proj -- ping"
+
+[tasks.tui]
+description = "Run terminal dashboard"
+run = "./scripts/cargo-safe.sh run -p proj-tui --"
 
 [tasks.daemon-start]
 description = "Start daemon in background"

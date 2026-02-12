@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/proj",
+  "crates/proj-tui",
   "crates/projd",
   "crates/projd-types",
 ]
@@ -21,3 +22,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 toml = "0.8"
 libc = "0.2"
 regex = "1.12"
+crossterm = "0.28"
+ratatui = "0.29"

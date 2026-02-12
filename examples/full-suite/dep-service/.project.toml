@@ -1,0 +1,8 @@
+name = "dep-service"
+path = "."
+
+[server]
+command = "sh ./scripts/server.sh"
+port_env = "PORT"
+ready_pattern = "DEP_READY"
+cwd = "."

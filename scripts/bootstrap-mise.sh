@@ -14,12 +14,13 @@ export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
 mise trust "$ROOT_DIR" >/dev/null 2>&1 || true
 mise install
 
-echo "Installing proj/projd CLI binaries..."
+echo "Installing proj/projd/proj-tui CLI binaries..."
 if CARGO_NET_OFFLINE=false ./scripts/cargo-safe.sh install --path crates/proj --force \
-  && CARGO_NET_OFFLINE=false ./scripts/cargo-safe.sh install --path crates/projd --force; then
-  echo "Installed proj/projd to $HOME/.cargo/bin."
+  && CARGO_NET_OFFLINE=false ./scripts/cargo-safe.sh install --path crates/projd --force \
+  && CARGO_NET_OFFLINE=false ./scripts/cargo-safe.sh install --path crates/proj-tui --force; then
+  echo "Installed proj/projd/proj-tui to $HOME/.cargo/bin."
 else
-  echo "Warning: failed to install proj/projd automatically."
+  echo "Warning: failed to install proj/projd/proj-tui automatically."
   echo "You can retry with: mise run install-cli"
 fi
 

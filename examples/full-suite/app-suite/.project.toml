@@ -1,0 +1,31 @@
+name = "app-suite"
+path = "."
+depends_on = ["../dep-service"]
+
+[server]
+command = "sh ./scripts/server.sh"
+port_env = "APP_PORT"
+ready_pattern = "APP_READY"
+cwd = "."
+
+[[agents]]
+name = "indexer"
+command = "sh ./scripts/agent-indexer.sh"
+cwd = "."
+
+[[terminals]]
+name = "dev-shell"
+command = "sh ./scripts/terminal-dev.sh"
+cwd = "."
+
+[editor]
+command = "sh"
+args = ["./scripts/editor-open.sh"]
+cwd = "."
+
+[browser]
+command = "xdg-open"
+urls = [
+  "http://localhost:${PORT}/health",
+  "http://localhost:${PORT}/dashboard"
+]
