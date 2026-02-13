@@ -1688,6 +1688,9 @@ impl AppState {
 
         let managed_fragment = render_niri_fragment(&self.projects);
         let updated = write_managed_section(&current, &managed_fragment)?;
+        if updated == current {
+            return Ok(());
+        }
         atomic_write_file(&self.niri_config_path, updated.as_bytes())?;
         Ok(())
     }
