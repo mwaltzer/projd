@@ -2490,10 +2490,19 @@ fn focus_workspace_in_niri(workspace: &str) -> Result<()> {
 }
 
 fn surface_window_in_niri(workspace: &str) -> Result<bool> {
+    let Some(workspace_id) = workspace_id_from_niri(workspace) else {
+        return Ok(false);
+    };
+    let Some(window_id) = active_or_first_window_id_from_niri(workspace_id) else {
+        return Ok(false);
+    };
+    let window_id_arg = window_id.to_string();
     let output = Command::new(niri_binary())
         .arg("msg")
         .arg("action")
         .arg("focus-window")
+        .arg("--id")
+        .arg(&window_id_arg)
         .output()
         .with_context(|| {
             format!("failed to execute niri focus-window command in workspace '{workspace}'")
@@ -2510,6 +2519,77 @@ fn surface_window_in_niri(workspace: &str) -> Result<bool> {
         bail!("niri focus-window command failed in workspace '{workspace}'");
     }
     bail!("niri focus-window command failed in workspace '{workspace}': {stderr}");
+}
+
+fn workspace_id_from_niri(workspace: &str) -> Option<u64> {
+    let output = Command::new(niri_binary())
+        .arg("msg")
+        .arg("--json")
+        .arg("workspaces")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let workspaces = value.as_array()?;
+    workspaces.iter().find_map(|item| {
+        let object = item.as_object()?;
+        let name = object.get("name")?.as_str()?;
+        if name != workspace {
+            return None;
+        }
+        object.get("id")?.as_u64()
+    })
+}
+
+fn active_or_first_window_id_from_niri(workspace_id: u64) -> Option<u64> {
+    if let Some(active) = active_window_id_from_niri_workspace(workspace_id) {
+        return Some(active);
+    }
+    first_window_id_from_niri_workspace(workspace_id)
+}
+
+fn active_window_id_from_niri_workspace(workspace_id: u64) -> Option<u64> {
+    let output = Command::new(niri_binary())
+        .arg("msg")
+        .arg("--json")
+        .arg("workspaces")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let workspaces = value.as_array()?;
+    workspaces.iter().find_map(|item| {
+        let object = item.as_object()?;
+        if object.get("id")?.as_u64()? != workspace_id {
+            return None;
+        }
+        object.get("active_window_id").and_then(Value::as_u64)
+    })
+}
+
+fn first_window_id_from_niri_workspace(workspace_id: u64) -> Option<u64> {
+    let output = Command::new(niri_binary())
+        .arg("msg")
+        .arg("--json")
+        .arg("windows")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let windows = value.as_array()?;
+    windows.iter().find_map(|item| {
+        let object = item.as_object()?;
+        if object.get("workspace_id")?.as_u64()? != workspace_id {
+            return None;
+        }
+        object.get("id")?.as_u64()
+    })
 }
 
 fn reload_niri_config_in_niri() -> Result<()> {
