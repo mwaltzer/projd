@@ -10,6 +10,7 @@
 
 ```bash
 mise run bootstrap
+mise run install-niri
 mise run build-link
 mise run daemon-start
 mise run ping
@@ -18,6 +19,27 @@ proj --help
 
 `proj ping` autostarts `projd` if it is not running.
 `mise run bootstrap` also installs `proj`/`projd` into `~/.cargo/bin`.
+`mise run install-niri` installs managed Niri integration defaults (keybinding + status watch helper).
+
+## Problem solved: ding to exact context
+
+Typical flow after this slice:
+
+```bash
+# 1) runtime process exits -> desktop notification includes:
+#    "<project>: process failed" and "run `proj focus <project>` to jump back"
+
+# 2) jump directly to the right context
+proj focus app-suite
+
+# 3) confirm machine-readable state if needed
+proj status --json
+```
+
+`proj focus <name>` attempts to:
+1. Focus the Niri workspace for that project.
+2. Surface a relevant window in that workspace (best effort).
+3. Return structured status + warnings when any step is partially unavailable.
 
 ## First project onboarding
 
@@ -42,6 +64,7 @@ Lifecycle controls:
 
 ```bash
 proj switch <name>
+proj focus <name>
 proj suspend <name>
 proj resume <name>
 ```
@@ -101,16 +124,18 @@ proj init
 proj up [path|name]
 proj down <name>
 proj switch <name>
+proj focus <name>
 proj suspend <name>
 proj resume <name>
 proj peek <name>
-proj status [name]
-proj logs <name> [process]
+proj status [name] [--json] [--watch --interval-ms 1000]
+proj logs <name> [process] [--json] [--tail 200]
 proj list
 proj ping
 proj daemon start
 proj daemon stop
 proj daemon status
+proj install niri [--config <path>] [--interval-ms 1000]
 proj-tui
 ```
 
@@ -125,6 +150,7 @@ Implemented:
 - Persisted focus/suspend lifecycle state across daemon restarts
 - Runtime process orchestration for `server`, `agents`, `terminals`, `editor`, and `browser` launch commands
 - Per-process log capture and retrieval via `proj logs`
+- Runtime exit/failure desktop notifications with project/process context and `proj focus <name>` jump hint
 - Dependency startup for `depends_on` (path dependencies, plus already-registered name dependencies)
 - Browser launch gating with `server.ready_pattern`
 - Machine-readable status output via `proj status --json` (for Quickshell/Waybar integrations)
@@ -150,6 +176,14 @@ Run the terminal dashboard with:
 mise run tui
 ```
 
+Useful keys in `proj-tui`:
+- `j`/`k` or arrows: move selection
+- `g` / `G`: jump to first/last project
+- `enter`: switch to selected project
+- `p`: peek selected project state
+- `l`: load logs for selected project
+- `f`: enable/disable log-follow mode
+
 ## Full Suite Demo
 
 A runnable end-to-end demo lives at `examples/full-suite`:
@@ -169,7 +203,7 @@ This starts:
 
 ## Quickshell Integration
 
-Use `proj status --json` as the polling source and call `proj switch <name>` for actions.
+Use `proj status --json` as the polling source and call `proj focus <name>` (or `proj switch <name>`) for actions.
 
 Example polling command:
 
@@ -181,4 +215,18 @@ This returns compact JSON shaped like:
 
 ```json
 {"projects":[{"project":{"name":"frontend","path":"/home/me/Code/frontend","workspace":"frontend","port":3001},"state":"active","focused":true}]}
+```
+
+For stream-based integrations (Waybar, Quickshell, custom dashboards), you can emit newline-delimited status snapshots:
+
+```bash
+proj status --json --watch --interval-ms 1000
+```
+
+`proj install niri` also installs a helper script at `~/.config/proj/status-watch.sh` that runs this watch command.
+
+For machine-readable logs:
+
+```bash
+proj logs frontend --json --tail 200
 ```

@@ -20,14 +20,18 @@ This will auto-register and start both projects due to `depends_on = ["../dep-se
 proj list
 proj status
 proj status --json
+proj status --json --watch --interval-ms 1000
 proj logs app-suite
+proj logs app-suite --json --tail 200
 proj logs app-suite server
 proj logs dep-service server
 proj switch dep-service
 proj switch app-suite
+proj focus app-suite
 proj suspend app-suite
 proj resume app-suite
 proj-tui
+./scripts/status-watch.sh
 ```
 
 ## Cleanup

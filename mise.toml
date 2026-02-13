@@ -12,6 +12,10 @@ run = "./scripts/bootstrap-mise.sh"
 description = "Install proj/projd/proj-tui into ~/.cargo/bin"
 run = "CARGO_NET_OFFLINE=false ./scripts/cargo-safe.sh install --path crates/proj --force && CARGO_NET_OFFLINE=false ./scripts/cargo-safe.sh install --path crates/projd --force && CARGO_NET_OFFLINE=false ./scripts/cargo-safe.sh install --path crates/proj-tui --force"
 
+[tasks.install-niri]
+description = "Install managed Niri focus/status integration"
+run = "./scripts/cargo-safe.sh run -p proj -- install niri"
+
 [tasks.build]
 description = "Compile-check proj and projd (sandbox-safe)"
 run = "./scripts/cargo-safe.sh check --workspace"

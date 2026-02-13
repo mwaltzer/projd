@@ -1,14 +1,17 @@
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use projd_types::{
-    default_socket_path, DownParams, ListResult, LogsParams, LogsResult, NameParams,
-    ProjectLifecycleState, ProjectStatus, Request, Response, StatusParams, StatusResult, UpParams,
-    UpResult, METHOD_DOWN, METHOD_LIST, METHOD_LOGS, METHOD_PEEK, METHOD_PING, METHOD_RESUME,
-    METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND, METHOD_SWITCH, METHOD_UP,
+    default_niri_config_path, default_socket_path, DownParams, FocusResult, ListResult, LogsParams,
+    LogsResult, NameParams, ProjectLifecycleState, ProjectStatus, Request, Response, StatusParams,
+    StatusResult, UpParams, UpResult, METHOD_DOWN, METHOD_FOCUS, METHOD_LIST, METHOD_LOGS,
+    METHOD_PEEK, METHOD_PING, METHOD_RESUME, METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND,
+    METHOD_SWITCH, METHOD_UP, NIRI_INTEGRATION_END, NIRI_INTEGRATION_START,
 };
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,7 +29,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Create a starter .project.toml in the current directory.
     Init,
+    /// Register and start a project from a path or project name.
     Up {
         #[arg(value_name = "PATH_OR_NAME")]
         path: Option<PathBuf>,
@@ -48,6 +53,7 @@ enum Commands {
         #[arg(long = "no-autostart")]
         no_autostart: bool,
     },
+    /// Switch active project state and focus its workspace.
     Switch {
         name: String,
         #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
@@ -55,6 +61,15 @@ enum Commands {
         #[arg(long = "no-autostart")]
         no_autostart: bool,
     },
+    /// Focus project context (workspace + best-effort window surfacing).
+    Focus {
+        name: String,
+        #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
+        autostart: bool,
+        #[arg(long = "no-autostart")]
+        no_autostart: bool,
+    },
+    /// Mark a project as suspended.
     Suspend {
         name: String,
         #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
@@ -62,6 +77,7 @@ enum Commands {
         #[arg(long = "no-autostart")]
         no_autostart: bool,
     },
+    /// Resume a suspended project and focus it.
     Resume {
         name: String,
         #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
@@ -69,6 +85,7 @@ enum Commands {
         #[arg(long = "no-autostart")]
         no_autostart: bool,
     },
+    /// Inspect project runtime state without mutating focus.
     Peek {
         name: String,
         #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
@@ -76,6 +93,7 @@ enum Commands {
         #[arg(long = "no-autostart")]
         no_autostart: bool,
     },
+    /// Show project lifecycle state.
     Status {
         name: Option<String>,
         #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
@@ -84,7 +102,12 @@ enum Commands {
         no_autostart: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(long, default_value_t = false)]
+        watch: bool,
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
     },
+    /// Show captured logs for a project/process.
     Logs {
         name: String,
         process: Option<String>,
@@ -92,16 +115,27 @@ enum Commands {
         autostart: bool,
         #[arg(long = "no-autostart")]
         no_autostart: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long)]
+        tail: Option<usize>,
     },
+    /// Ping daemon health.
     Ping {
         #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
         autostart: bool,
         #[arg(long = "no-autostart")]
         no_autostart: bool,
     },
+    /// Manage daemon lifecycle.
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    /// Install optional integrations.
+    Install {
+        #[command(subcommand)]
+        command: InstallCommand,
     },
 }
 
@@ -110,6 +144,17 @@ enum DaemonCommand {
     Start,
     Stop,
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum InstallCommand {
+    /// Install managed Niri keybinding and status-watch defaults.
+    Niri {
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -149,6 +194,15 @@ fn main() -> Result<()> {
             &name,
             resolve_autostart(autostart, no_autostart),
         ),
+        Commands::Focus {
+            name,
+            autostart,
+            no_autostart,
+        } => cmd_focus(
+            &socket_path,
+            &name,
+            resolve_autostart(autostart, no_autostart),
+        ),
         Commands::Suspend {
             name,
             autostart,
@@ -181,22 +235,30 @@ fn main() -> Result<()> {
             autostart,
             no_autostart,
             json,
+            watch,
+            interval_ms,
         } => cmd_status_projects(
             &socket_path,
             name,
             resolve_autostart(autostart, no_autostart),
             json,
+            watch,
+            interval_ms,
         ),
         Commands::Logs {
             name,
             process,
             autostart,
             no_autostart,
+            json,
+            tail,
         } => cmd_logs(
             &socket_path,
             &name,
             process.as_deref(),
             resolve_autostart(autostart, no_autostart),
+            json,
+            tail,
         ),
         Commands::Ping {
             autostart,
@@ -206,6 +268,12 @@ fn main() -> Result<()> {
             DaemonCommand::Start => cmd_start(&socket_path),
             DaemonCommand::Stop => cmd_stop(&socket_path),
             DaemonCommand::Status => cmd_status(&socket_path),
+        },
+        Commands::Install { command } => match command {
+            InstallCommand::Niri {
+                config,
+                interval_ms,
+            } => cmd_install_niri(config, interval_ms),
         },
     }
 }
@@ -343,6 +411,28 @@ fn cmd_switch(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_focus(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
+    let response = request_with_autostart(
+        socket_path,
+        METHOD_FOCUS,
+        serde_json::to_value(NameParams {
+            name: name.to_string(),
+        })
+        .context("failed to serialize focus params")?,
+        autostart,
+    )?;
+    let result: FocusResult = parse_ok_response(response)?;
+    print_project_status(&result.status);
+    println!(
+        "focus workspace_focused={} windows_surfaced={}",
+        result.workspace_focused, result.windows_surfaced
+    );
+    for warning in result.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
 fn cmd_suspend(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
     let status = request_name_status(socket_path, METHOD_SUSPEND, name, autostart)?;
     print_project_status(&status);
@@ -366,20 +456,59 @@ fn cmd_status_projects(
     name: Option<String>,
     autostart: bool,
     json_output: bool,
+    watch: bool,
+    interval_ms: u64,
 ) -> Result<()> {
+    if !watch {
+        let result = request_status_result(socket_path, name.as_deref(), autostart)?;
+        print!("{}", format_status_output(&result, json_output)?);
+        return Ok(());
+    }
+
+    let interval = Duration::from_millis(interval_ms.max(200));
+    loop {
+        let result = request_status_result(socket_path, name.as_deref(), autostart)?;
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string(&result).context("failed to serialize status JSON")?
+            );
+        } else {
+            print!("\x1b[2J\x1b[H");
+            print!("{}", format_status_output(&result, false)?);
+        }
+        io::stdout()
+            .flush()
+            .context("failed to flush status watch output")?;
+        thread::sleep(interval);
+    }
+}
+
+fn request_status_result(
+    socket_path: &Path,
+    name: Option<&str>,
+    autostart: bool,
+) -> Result<StatusResult> {
     let response = request_with_autostart(
         socket_path,
         METHOD_STATUS,
-        serde_json::to_value(StatusParams { name }).context("failed to serialize status params")?,
+        serde_json::to_value(StatusParams {
+            name: name.map(ToString::to_string),
+        })
+        .context("failed to serialize status params")?,
         autostart,
     )?;
-    let result: StatusResult = parse_ok_response(response)?;
-    print!("{}", format_status_output(&result, json_output)?);
-
-    Ok(())
+    parse_ok_response(response)
 }
 
-fn cmd_logs(socket_path: &Path, name: &str, process: Option<&str>, autostart: bool) -> Result<()> {
+fn cmd_logs(
+    socket_path: &Path,
+    name: &str,
+    process: Option<&str>,
+    autostart: bool,
+    json_output: bool,
+    tail: Option<usize>,
+) -> Result<()> {
     let response = request_with_autostart(
         socket_path,
         METHOD_LOGS,
@@ -390,25 +519,53 @@ fn cmd_logs(socket_path: &Path, name: &str, process: Option<&str>, autostart: bo
         .context("failed to serialize logs params")?,
         autostart,
     )?;
-    let logs: LogsResult = parse_ok_response(response)?;
-    if logs.logs.is_empty() {
-        println!("no logs for {}", logs.project);
-        return Ok(());
+    let mut logs: LogsResult = parse_ok_response(response)?;
+
+    if let Some(tail_lines) = tail {
+        for item in &mut logs.logs {
+            item.content = tail_content_lines(&item.content, tail_lines);
+        }
     }
 
-    for (index, item) in logs.logs.iter().enumerate() {
-        if logs.logs.len() > 1 {
-            if index > 0 {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&logs).context("failed to serialize logs JSON")?
+        );
+    } else {
+        if logs.logs.is_empty() {
+            println!("no logs for {}", logs.project);
+            return Ok(());
+        }
+        for (index, item) in logs.logs.iter().enumerate() {
+            if logs.logs.len() > 1 {
+                if index > 0 {
+                    println!();
+                }
+                println!("== {} ({}) ==", item.process, item.path);
+            }
+            print!("{}", item.content);
+            if !item.content.ends_with('\n') {
                 println!();
             }
-            println!("== {} ({}) ==", item.process, item.path);
-        }
-        print!("{}", item.content);
-        if !item.content.ends_with('\n') {
-            println!();
         }
     }
     Ok(())
+}
+
+fn tail_content_lines(content: &str, tail_lines: usize) -> String {
+    if tail_lines == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= tail_lines {
+        return content.to_string();
+    }
+    let mut rendered = lines[lines.len() - tail_lines..].join("\n");
+    if content.ends_with('\n') {
+        rendered.push('\n');
+    }
+    rendered
 }
 
 fn request_name_status(
@@ -605,6 +762,141 @@ fn expand_tilde_path(raw: &str) -> PathBuf {
     }
 
     PathBuf::from(raw)
+}
+
+fn cmd_install_niri(config: Option<PathBuf>, interval_ms: u64) -> Result<()> {
+    let config_path = config.unwrap_or_else(default_niri_config_path);
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let current = if config_path.exists() {
+        fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?
+    } else {
+        String::new()
+    };
+
+    let status_watch_script = proj_config_dir().join("status-watch.sh");
+    write_status_watch_script(&status_watch_script, interval_ms.max(200))?;
+
+    let fragment = render_niri_integration_fragment(&status_watch_script, interval_ms.max(200));
+    let updated = write_managed_install_section(&current, &fragment)?;
+    fs::write(&config_path, updated)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    println!("updated {}", config_path.display());
+    println!("installed {}", status_watch_script.display());
+    println!(
+        "status stream: proj status --json --watch --interval-ms {}",
+        interval_ms.max(200)
+    );
+    println!("focus command: proj focus <project>");
+    Ok(())
+}
+
+fn proj_config_dir() -> PathBuf {
+    if let Some(value) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(value).join("proj");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".config").join("proj");
+    }
+    PathBuf::from(".config").join("proj")
+}
+
+fn write_status_watch_script(path: &Path, interval_ms: u64) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let content = format!(
+        "#!/usr/bin/env sh\nset -eu\nexec proj status --json --watch --interval-ms {interval_ms}\n"
+    );
+    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(path)
+            .with_context(|| format!("failed to read metadata for {}", path.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn render_niri_integration_fragment(status_watch_script: &Path, interval_ms: u64) -> String {
+    format!(
+        "// generated by proj install niri\n\
+// Open the dashboard and run focus actions from there.\n\
+binds {{\n\
+  Mod+Shift+P {{ spawn \"proj-tui\"; }}\n\
+}}\n\
+// Bars/shells can stream status from:\n\
+//   {}\n\
+// Equivalent command:\n\
+//   proj status --json --watch --interval-ms {}\n\
+// Notification jump hint:\n\
+//   proj focus <project>\n",
+        status_watch_script.display(),
+        interval_ms
+    )
+}
+
+fn write_managed_install_section(config: &str, managed_fragment: &str) -> Result<String> {
+    let managed_section = format!(
+        "{start}\n{fragment}{end}\n",
+        start = NIRI_INTEGRATION_START,
+        fragment = with_trailing_newline(managed_fragment),
+        end = NIRI_INTEGRATION_END
+    );
+
+    let start = config.find(NIRI_INTEGRATION_START);
+    let end = config.find(NIRI_INTEGRATION_END);
+    match (start, end) {
+        (Some(start_idx), Some(end_idx)) => {
+            if end_idx < start_idx {
+                bail!("invalid niri config: integration marker end appears before start");
+            }
+            let end_bound = end_idx + NIRI_INTEGRATION_END.len();
+            let mut output = String::new();
+            output.push_str(&config[..start_idx]);
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&managed_section);
+            let suffix = config[end_bound..].trim_start_matches('\n');
+            if !suffix.is_empty() {
+                output.push_str(suffix);
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+            Ok(output)
+        }
+        (None, None) => {
+            let mut output = config.to_string();
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            if !output.trim().is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&managed_section);
+            Ok(output)
+        }
+        _ => bail!("invalid niri config: found only one proj install marker"),
+    }
+}
+
+fn with_trailing_newline(value: &str) -> String {
+    if value.ends_with('\n') {
+        value.to_string()
+    } else {
+        format!("{value}\n")
+    }
 }
 
 fn init_project_config(project_dir: &Path) -> Result<PathBuf> {
@@ -942,6 +1234,114 @@ mod tests {
         assert!(output.contains("demo"));
         assert!(output.contains("state=backgrounded"));
         assert!(output.ends_with('\n'));
+    }
+
+    #[test]
+    fn status_cli_supports_watch_and_interval_flags() {
+        let cli = Cli::try_parse_from([
+            "proj",
+            "status",
+            "--json",
+            "--watch",
+            "--interval-ms",
+            "750",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Status {
+                json,
+                watch,
+                interval_ms,
+                ..
+            } => {
+                assert!(json);
+                assert!(watch);
+                assert_eq!(interval_ms, 750);
+            }
+            _ => panic!("expected status command"),
+        }
+    }
+
+    #[test]
+    fn logs_cli_supports_json_and_tail_flags() {
+        let cli = Cli::try_parse_from(["proj", "logs", "demo", "--json", "--tail", "25"]).unwrap();
+        match cli.command {
+            Commands::Logs { json, tail, .. } => {
+                assert!(json);
+                assert_eq!(tail, Some(25));
+            }
+            _ => panic!("expected logs command"),
+        }
+    }
+
+    #[test]
+    fn tail_content_lines_returns_last_n_lines() {
+        let content = "line-1\nline-2\nline-3\n";
+        assert_eq!(tail_content_lines(content, 2), "line-2\nline-3\n");
+        assert_eq!(tail_content_lines(content, 5), content);
+        assert_eq!(tail_content_lines(content, 0), "");
+    }
+
+    #[test]
+    fn focus_cli_supports_autostart_flags() {
+        let cli = Cli::try_parse_from(["proj", "focus", "frontend", "--no-autostart"]).unwrap();
+        match cli.command {
+            Commands::Focus {
+                name,
+                autostart,
+                no_autostart,
+            } => {
+                assert_eq!(name, "frontend");
+                assert!(autostart);
+                assert!(no_autostart);
+                assert!(!resolve_autostart(autostart, no_autostart));
+            }
+            _ => panic!("expected focus command"),
+        }
+    }
+
+    #[test]
+    fn install_niri_cli_supports_config_and_interval_flags() {
+        let cli = Cli::try_parse_from([
+            "proj",
+            "install",
+            "niri",
+            "--config",
+            "/tmp/niri/config.kdl",
+            "--interval-ms",
+            "750",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Install { command } => match command {
+                InstallCommand::Niri {
+                    config,
+                    interval_ms,
+                } => {
+                    assert_eq!(config, Some(PathBuf::from("/tmp/niri/config.kdl")));
+                    assert_eq!(interval_ms, 750);
+                }
+            },
+            _ => panic!("expected install niri command"),
+        }
+    }
+
+    #[test]
+    fn write_managed_install_section_is_idempotent() {
+        let source = "input {\n  keyboard {}\n}\n";
+        let first = write_managed_install_section(source, "binds {}\n").unwrap();
+        let second = write_managed_install_section(&first, "binds {}\n").unwrap();
+        assert_eq!(first, second);
+        assert!(second.contains(NIRI_INTEGRATION_START));
+        assert!(second.contains(NIRI_INTEGRATION_END));
+    }
+
+    #[test]
+    fn render_niri_integration_fragment_mentions_focus_and_status_watch() {
+        let fragment = render_niri_integration_fragment(Path::new("/tmp/status-watch.sh"), 1000);
+        assert!(fragment.contains("proj focus <project>"));
+        assert!(fragment.contains("status-watch.sh"));
+        assert!(fragment.contains("--interval-ms 1000"));
     }
 
     #[test]

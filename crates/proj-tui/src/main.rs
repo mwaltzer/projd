@@ -8,8 +8,8 @@ use crossterm::terminal::{
 use projd_types::{
     default_socket_path, DownParams, LogsParams, LogsResult, NameParams, ProjectLifecycleState,
     ProjectStatus, Request, Response, StatusParams, StatusResult, UpParams, METHOD_DOWN,
-    METHOD_LOGS, METHOD_PING, METHOD_RESUME, METHOD_STATUS, METHOD_SUSPEND, METHOD_SWITCH,
-    METHOD_UP,
+    METHOD_FOCUS, METHOD_LOGS, METHOD_PEEK, METHOD_PING, METHOD_RESUME, METHOD_STATUS,
+    METHOD_SUSPEND, METHOD_SWITCH, METHOD_UP,
 };
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
@@ -42,6 +42,7 @@ struct App {
     selected: usize,
     logs: String,
     status_message: String,
+    follow_logs: bool,
 }
 
 impl App {
@@ -80,6 +81,22 @@ impl App {
         } else {
             self.selected -= 1;
         }
+    }
+
+    fn select_first(&mut self) {
+        if self.projects.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        self.selected = 0;
+    }
+
+    fn select_last(&mut self) {
+        if self.projects.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        self.selected = self.projects.len() - 1;
     }
 }
 
@@ -142,6 +159,10 @@ fn run_tui(socket_path: &Path, autostart: bool, refresh_ms: u64) -> Result<()> {
         if last_refresh.elapsed() >= refresh_interval {
             if let Err(err) = refresh_status(socket_path, autostart, &mut app) {
                 app.status_message = format!("status refresh failed: {err}");
+            } else if app.follow_logs {
+                if let Err(err) = load_selected_logs(socket_path, autostart, &mut app) {
+                    app.status_message = format!("logs refresh failed: {err}");
+                }
             }
             last_refresh = Instant::now();
         }
@@ -160,7 +181,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
     .split(frame.area());
 
     let help = Paragraph::new(
-        "q quit | j/k move | r refresh | u up(cwd) | s switch | z suspend | e resume | d down | l logs",
+        "q quit | j/k move | g/G first/last | enter focus | p peek | r refresh | u up(cwd) | s switch | z suspend | e resume | d down | l logs | f follow logs",
     );
     frame.render_widget(help, chunks[0]);
 
@@ -206,12 +227,36 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
 }
 
 fn handle_key(code: KeyCode, socket_path: &Path, autostart: bool, app: &mut App) -> Result<bool> {
+    let mut selection_changed = false;
     match code {
         KeyCode::Char('q') => return Ok(true),
-        KeyCode::Char('j') | KeyCode::Down => app.select_next(),
-        KeyCode::Char('k') | KeyCode::Up => app.select_previous(),
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.select_next();
+            selection_changed = true;
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.select_previous();
+            selection_changed = true;
+        }
+        KeyCode::Char('g') => {
+            app.select_first();
+            selection_changed = true;
+        }
+        KeyCode::Char('G') => {
+            app.select_last();
+            selection_changed = true;
+        }
+        KeyCode::Enter => {
+            invoke_selected_name_action(socket_path, METHOD_FOCUS, autostart, app)?;
+        }
+        KeyCode::Char('p') => {
+            invoke_selected_name_action(socket_path, METHOD_PEEK, autostart, app)?;
+        }
         KeyCode::Char('r') => {
             refresh_status(socket_path, autostart, app)?;
+            if app.follow_logs {
+                load_selected_logs(socket_path, autostart, app)?;
+            }
             app.status_message = "refreshed status".to_string();
         }
         KeyCode::Char('u') => {
@@ -228,6 +273,9 @@ fn handle_key(code: KeyCode, socket_path: &Path, autostart: bool, app: &mut App)
             let result: projd_types::UpResult = parse_ok_response(response)?;
             app.status_message = format!("up {} (created={})", result.project.name, result.created);
             refresh_status(socket_path, autostart, app)?;
+            if app.follow_logs {
+                load_selected_logs(socket_path, autostart, app)?;
+            }
         }
         KeyCode::Char('s') => {
             invoke_selected_name_action(socket_path, METHOD_SWITCH, autostart, app)?;
@@ -253,27 +301,30 @@ fn handle_key(code: KeyCode, socket_path: &Path, autostart: bool, app: &mut App)
             let removed: projd_types::ProjectRecord = parse_ok_response(response)?;
             app.status_message = format!("down {}", removed.name);
             refresh_status(socket_path, autostart, app)?;
+            if app.follow_logs {
+                load_selected_logs(socket_path, autostart, app)?;
+            }
         }
         KeyCode::Char('l') => {
-            let Some(name) = app.selected_project_name().map(ToString::to_string) else {
-                app.status_message = "no project selected".to_string();
-                return Ok(false);
-            };
-            let response = request_with_autostart(
-                socket_path,
-                METHOD_LOGS,
-                serde_json::to_value(LogsParams {
-                    name: name.clone(),
-                    process: None,
-                })
-                .context("failed to serialize logs params")?,
-                autostart,
-            )?;
-            let logs: LogsResult = parse_ok_response(response)?;
-            app.logs = render_logs(&logs);
-            app.status_message = format!("loaded logs for {}", name);
+            load_selected_logs(socket_path, autostart, app)?;
+        }
+        KeyCode::Char('f') => {
+            app.follow_logs = !app.follow_logs;
+            if app.follow_logs {
+                load_selected_logs(socket_path, autostart, app)?;
+                app.status_message = format!(
+                    "log follow enabled for {}",
+                    app.selected_project_name().unwrap_or("none")
+                );
+            } else {
+                app.status_message = "log follow disabled".to_string();
+            }
         }
         _ => {}
+    }
+
+    if selection_changed && app.follow_logs {
+        load_selected_logs(socket_path, autostart, app)?;
     }
     Ok(false)
 }
@@ -298,6 +349,9 @@ fn invoke_selected_name_action(
     let _: ProjectStatus = parse_ok_response(response)?;
     app.status_message = format!("{method} {name}");
     refresh_status(socket_path, autostart, app)?;
+    if app.follow_logs {
+        load_selected_logs(socket_path, autostart, app)?;
+    }
     Ok(())
 }
 
@@ -314,6 +368,28 @@ fn refresh_status(socket_path: &Path, autostart: bool, app: &mut App) -> Result<
     if app.projects.is_empty() {
         app.logs.clear();
     }
+    Ok(())
+}
+
+fn load_selected_logs(socket_path: &Path, autostart: bool, app: &mut App) -> Result<()> {
+    let Some(name) = app.selected_project_name().map(ToString::to_string) else {
+        app.logs.clear();
+        app.status_message = "no project selected".to_string();
+        return Ok(());
+    };
+    let response = request_with_autostart(
+        socket_path,
+        METHOD_LOGS,
+        serde_json::to_value(LogsParams {
+            name: name.clone(),
+            process: None,
+        })
+        .context("failed to serialize logs params")?,
+        autostart,
+    )?;
+    let logs: LogsResult = parse_ok_response(response)?;
+    app.logs = render_logs(&logs);
+    app.status_message = format!("loaded logs for {}", name);
     Ok(())
 }
 
@@ -497,6 +573,7 @@ mod tests {
             selected: 1,
             logs: String::new(),
             status_message: String::new(),
+            follow_logs: false,
         };
         app.set_projects(vec![status("a", ProjectLifecycleState::Active)]);
         assert_eq!(app.selected, 0);
