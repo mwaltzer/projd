@@ -1,8 +1,8 @@
 use projd_types::{
-    DownParams, ListResult, NameParams, ProjectLifecycleState, Request, Response, StatusParams,
-    StatusResult, UpParams, UpResult, METHOD_DOWN, METHOD_LIST, METHOD_PEEK, METHOD_PING,
-    METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND, METHOD_UP, NIRI_MANAGED_END,
-    NIRI_MANAGED_START,
+    DownParams, FocusResult, ListResult, NameParams, ProjectLifecycleState, Request, Response,
+    StatusParams, StatusResult, UpParams, UpResult, METHOD_DOWN, METHOD_FOCUS, METHOD_LIST,
+    METHOD_PEEK, METHOD_PING, METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND, METHOD_UP,
+    NIRI_MANAGED_END, NIRI_MANAGED_START,
 };
 use serde_json::Value;
 use std::fs;
@@ -24,6 +24,10 @@ struct DaemonHarness {
 
 impl DaemonHarness {
     fn start(initial_niri_config: &str) -> Self {
+        Self::start_with_env(initial_niri_config, &[])
+    }
+
+    fn start_with_env(initial_niri_config: &str, env: &[(String, String)]) -> Self {
         let root_dir = unique_temp_dir("niri-workflow");
         let socket_path = root_dir.join("projd.sock");
         let state_path = root_dir.join("state.json");
@@ -34,7 +38,9 @@ impl DaemonHarness {
             .expect("failed to create niri config directory");
         fs::write(&niri_config_path, initial_niri_config).expect("failed to seed niri config");
 
-        let child = spawn_projd(&socket_path, &state_path, &niri_config_path, router_port);
+        let mut daemon_env = env.to_vec();
+        daemon_env.push(("PROJD_ROUTER_PORT".to_string(), router_port.to_string()));
+        let child = spawn_projd(&socket_path, &state_path, &niri_config_path, &daemon_env);
 
         let harness = Self {
             child,
@@ -73,7 +79,7 @@ fn spawn_projd(
     socket_path: &Path,
     state_path: &Path,
     niri_config_path: &Path,
-    router_port: u16,
+    env: &[(String, String)],
 ) -> Child {
     if let Some(projd_bin) = detect_projd_binary() {
         return Command::new(projd_bin)
@@ -83,7 +89,7 @@ fn spawn_projd(
             .arg(state_path)
             .arg("--niri-config")
             .arg(niri_config_path)
-            .env("PROJD_ROUTER_PORT", router_port.to_string())
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -109,7 +115,7 @@ fn spawn_projd(
         .arg(state_path)
         .arg("--niri-config")
         .arg(niri_config_path)
-        .env("PROJD_ROUTER_PORT", router_port.to_string())
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(workspace_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -337,6 +343,120 @@ fn niri_workflow_suspend_transitions_project_state() {
             .unwrap();
     assert_eq!(suspended.state, ProjectLifecycleState::Suspended);
     assert!(!suspended.focused);
+}
+
+#[test]
+fn niri_workflow_focus_returns_success_details() {
+    let root = unique_temp_dir("niri-focus-success");
+    fs::create_dir_all(&root).unwrap();
+    let niri_script = root.join("niri-ok.sh");
+    let niri_log = root.join("niri.log");
+    fs::write(
+        &niri_script,
+        format!(
+            "#!/usr/bin/env sh\n\
+echo \"$*\" >> \"{}\"\n\
+if [ \"$1\" = \"msg\" ] && [ \"$2\" = \"--json\" ] && [ \"$3\" = \"focused-workspace\" ]; then\n\
+  echo '{{\"name\":\"focus-demo\"}}'\n\
+fi\n\
+exit 0\n",
+            niri_log.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&niri_script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&niri_script, perms).unwrap();
+    }
+
+    let harness = DaemonHarness::start_with_env(
+        "",
+        &[(
+            "PROJD_NIRI_BIN".to_string(),
+            niri_script.display().to_string(),
+        )],
+    );
+    let project_dir = harness.create_project_dir("focus-demo");
+    let up_response = request(
+        &harness.socket_path,
+        METHOD_UP,
+        serde_json::to_value(UpParams {
+            path: project_dir.to_string_lossy().to_string(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(up_response.ok, "up failed: {:?}", up_response.error);
+
+    let focus_response = request(
+        &harness.socket_path,
+        METHOD_FOCUS,
+        serde_json::to_value(NameParams {
+            name: "focus-demo".to_string(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        focus_response.ok,
+        "focus failed: {:?}",
+        focus_response.error
+    );
+    let result: FocusResult = serde_json::from_value(focus_response.result.unwrap()).unwrap();
+    assert!(result.workspace_focused);
+    assert!(result.windows_surfaced);
+    assert_eq!(result.status.project.name, "focus-demo");
+    assert!(result.warnings.is_empty());
+
+    let calls = fs::read_to_string(niri_log).unwrap();
+    assert!(calls.contains("msg action focus-workspace focus-demo"));
+    assert!(calls.contains("msg action focus-window"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn niri_workflow_focus_returns_warnings_when_niri_is_unavailable() {
+    let harness = DaemonHarness::start_with_env(
+        "",
+        &[(
+            "PROJD_NIRI_BIN".to_string(),
+            "command-that-does-not-exist".to_string(),
+        )],
+    );
+    let project_dir = harness.create_project_dir("focus-warn");
+    let up_response = request(
+        &harness.socket_path,
+        METHOD_UP,
+        serde_json::to_value(UpParams {
+            path: project_dir.to_string_lossy().to_string(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(up_response.ok, "up failed: {:?}", up_response.error);
+
+    let focus_response = request(
+        &harness.socket_path,
+        METHOD_FOCUS,
+        serde_json::to_value(NameParams {
+            name: "focus-warn".to_string(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        focus_response.ok,
+        "focus failed: {:?}",
+        focus_response.error
+    );
+    let result: FocusResult = serde_json::from_value(focus_response.result.unwrap()).unwrap();
+    assert!(!result.workspace_focused);
+    assert!(!result.windows_surfaced);
+    assert_eq!(result.status.project.name, "focus-warn");
+    assert!(!result.warnings.is_empty());
 }
 
 fn request(socket_path: &Path, method: &str, params: Value) -> Result<Response, String> {

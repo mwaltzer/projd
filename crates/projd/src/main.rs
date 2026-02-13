@@ -1,12 +1,12 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use projd_types::{
-    default_niri_config_path, default_socket_path, default_state_path, DownParams, ListResult,
-    LogsParams, LogsResult, NameParams, PersistedState, ProcessLogs, ProjectLifecycleState,
-    ProjectRecord, ProjectStatus, Request, Response, StatusParams, StatusResult, UpParams,
-    UpResult, METHOD_DOWN, METHOD_LIST, METHOD_LOGS, METHOD_PEEK, METHOD_PING, METHOD_RESUME,
-    METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND, METHOD_SWITCH, METHOD_UP, NIRI_MANAGED_END,
-    NIRI_MANAGED_START,
+    default_niri_config_path, default_socket_path, default_state_path, DownParams, FocusResult,
+    ListResult, LogsParams, LogsResult, NameParams, PersistedState, ProcessLogs,
+    ProjectLifecycleState, ProjectRecord, ProjectStatus, Request, Response, StatusParams,
+    StatusResult, UpParams, UpResult, METHOD_DOWN, METHOD_FOCUS, METHOD_LIST, METHOD_LOGS,
+    METHOD_PEEK, METHOD_PING, METHOD_RESUME, METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND,
+    METHOD_SWITCH, METHOD_UP, NIRI_MANAGED_END, NIRI_MANAGED_START,
 };
 use regex::Regex;
 use serde::de::DeserializeOwned;
@@ -94,6 +94,7 @@ fn main() -> Result<()> {
     });
 
     while running.load(Ordering::SeqCst) {
+        app_state.poll_runtime_events();
         match listener.accept() {
             Ok((stream, _)) => {
                 if let Err(err) = handle_client(stream, running.clone(), &mut app_state) {
@@ -511,6 +512,18 @@ fn handle_request(request: &Request, app_state: &mut AppState) -> (Response, boo
             ),
             Err(err) => (Response::err(request.id, err.to_string()), false),
         },
+        METHOD_FOCUS => match parse_params::<NameParams>(&request.params)
+            .and_then(|params| app_state.focus(&params.name))
+        {
+            Ok(result) => (
+                Response::ok(
+                    request.id,
+                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+                ),
+                false,
+            ),
+            Err(err) => (Response::err(request.id, err.to_string()), false),
+        },
         METHOD_SUSPEND => match parse_params::<NameParams>(&request.params)
             .and_then(|params| app_state.suspend(&params.name))
         {
@@ -917,6 +930,56 @@ impl AppState {
         Ok(self.project_status(&project))
     }
 
+    fn focus(&mut self, name: &str) -> Result<FocusResult> {
+        let project = self.project_by_name(name)?.clone();
+        if self.suspended_projects.contains(name) {
+            bail!("project '{}' is suspended; resume it before focusing", name);
+        }
+
+        let mut warnings = Vec::new();
+        let mut workspace_focused = false;
+        let mut windows_surfaced = false;
+
+        let previous_focus = self.focused_project.clone();
+        match focus_workspace_in_niri(&project.workspace) {
+            Ok(()) => {
+                workspace_focused = true;
+                self.focused_project = Some(project.name.clone());
+                if let Err(err) = self.persist_state() {
+                    self.focused_project = previous_focus;
+                    warnings.push(format!("failed to persist focused project: {err}"));
+                }
+            }
+            Err(err) => warnings.push(format!(
+                "failed to focus niri workspace '{}': {err}",
+                project.workspace
+            )),
+        }
+
+        match surface_window_in_niri(&project.workspace) {
+            Ok(surface_result) => {
+                windows_surfaced = surface_result;
+                if !surface_result {
+                    warnings.push(format!(
+                        "no window surfaced in workspace '{}'; workspace may not have visible windows yet",
+                        project.workspace
+                    ));
+                }
+            }
+            Err(err) => warnings.push(format!(
+                "failed to surface windows in workspace '{}': {err}",
+                project.workspace
+            )),
+        }
+
+        Ok(FocusResult {
+            status: self.project_status(&project),
+            workspace_focused,
+            windows_surfaced,
+            warnings,
+        })
+    }
+
     fn suspend(&mut self, name: &str) -> Result<ProjectStatus> {
         let project = self.project_by_name(name)?.clone();
         let previous_focus = self.focused_project.clone();
@@ -1055,6 +1118,47 @@ impl AppState {
             );
         }
         Ok(())
+    }
+
+    fn poll_runtime_events(&mut self) {
+        let project_names: Vec<String> = self.runtime_processes.keys().cloned().collect();
+        for project_name in project_names {
+            let Some(mut processes) = self.runtime_processes.remove(&project_name) else {
+                continue;
+            };
+
+            let mut still_running = Vec::new();
+            for mut process in processes.drain(..) {
+                match process.child.try_wait() {
+                    Ok(Some(status)) => {
+                        let context = RuntimeExitNotification {
+                            project_name: project_name.clone(),
+                            process_name: process.name.clone(),
+                            success: status.success(),
+                            exit_status: status.to_string(),
+                        };
+                        if let Err(err) = send_runtime_exit_notification(&context) {
+                            warn!(
+                                "failed to send runtime exit notification for project '{}', process '{}': {err}",
+                                context.project_name, context.process_name
+                            );
+                        }
+                    }
+                    Ok(None) => still_running.push(process),
+                    Err(err) => {
+                        warn!(
+                            "failed to poll runtime process status for project '{}', process '{}': {err}",
+                            project_name, process.name
+                        );
+                        still_running.push(process);
+                    }
+                }
+            }
+
+            if !still_running.is_empty() {
+                self.runtime_processes.insert(project_name, still_running);
+            }
+        }
     }
 
     fn project_by_name(&self, name: &str) -> Result<&ProjectRecord> {
@@ -2338,8 +2442,32 @@ fn sanitize_log_component(raw: &str) -> String {
     }
 }
 
+#[derive(Debug)]
+struct RuntimeExitNotification {
+    project_name: String,
+    process_name: String,
+    success: bool,
+    exit_status: String,
+}
+
+fn niri_binary() -> String {
+    std::env::var("PROJD_NIRI_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "niri".to_string())
+}
+
+fn notifier_binary() -> String {
+    std::env::var("PROJD_NOTIFY_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "notify-send".to_string())
+}
+
 fn focus_workspace_in_niri(workspace: &str) -> Result<()> {
-    let output = Command::new("niri")
+    let output = Command::new(niri_binary())
         .arg("msg")
         .arg("action")
         .arg("focus-workspace")
@@ -2361,8 +2489,31 @@ fn focus_workspace_in_niri(workspace: &str) -> Result<()> {
     bail!("niri focus command failed for workspace '{workspace}': {stderr}")
 }
 
+fn surface_window_in_niri(workspace: &str) -> Result<bool> {
+    let output = Command::new(niri_binary())
+        .arg("msg")
+        .arg("action")
+        .arg("focus-window")
+        .output()
+        .with_context(|| {
+            format!("failed to execute niri focus-window command in workspace '{workspace}'")
+        })?;
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.contains("NoWindowFocused") || stderr.contains("no window") {
+        return Ok(false);
+    }
+    if stderr.is_empty() {
+        bail!("niri focus-window command failed in workspace '{workspace}'");
+    }
+    bail!("niri focus-window command failed in workspace '{workspace}': {stderr}");
+}
+
 fn reload_niri_config_in_niri() -> Result<()> {
-    let output = Command::new("niri")
+    let output = Command::new(niri_binary())
         .arg("msg")
         .arg("action")
         .arg("load-config-file")
@@ -2381,7 +2532,7 @@ fn reload_niri_config_in_niri() -> Result<()> {
 }
 
 fn focused_workspace_from_niri() -> Option<String> {
-    let output = Command::new("niri")
+    let output = Command::new(niri_binary())
         .arg("msg")
         .arg("--json")
         .arg("focused-workspace")
@@ -2393,6 +2544,39 @@ fn focused_workspace_from_niri() -> Option<String> {
 
     let value: Value = serde_json::from_slice(&output.stdout).ok()?;
     find_workspace_name(&value)
+}
+
+fn send_runtime_exit_notification(context: &RuntimeExitNotification) -> Result<()> {
+    let title = format!(
+        "{}: {}",
+        context.project_name,
+        if context.success {
+            "process exited"
+        } else {
+            "process failed"
+        }
+    );
+    let body = format!(
+        "process: {}\nstatus: {}\nrun `proj focus {}` to jump back",
+        context.process_name, context.exit_status, context.project_name
+    );
+    let output = Command::new(notifier_binary())
+        .arg(title)
+        .arg(body)
+        .output()
+        .context("failed to execute desktop notifier")?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        bail!("desktop notifier exited with status {}", output.status);
+    }
+    bail!(
+        "desktop notifier exited with status {}: {stderr}",
+        output.status
+    );
 }
 
 fn find_workspace_name(value: &Value) -> Option<String> {
@@ -2426,6 +2610,8 @@ fn find_workspace_name(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -2949,6 +3135,152 @@ urls = [\"http://localhost:${PORT}\"]\n",
         assert_eq!(stored.suspended_projects, vec!["frontend".to_string()]);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn focus_reports_warnings_when_niri_commands_fail() {
+        let _guard = env_lock().lock().unwrap();
+        let previous_niri = std::env::var_os("PROJD_NIRI_BIN");
+        std::env::set_var("PROJD_NIRI_BIN", "command-that-does-not-exist");
+
+        let base = unique_temp_dir("focus-warnings");
+        fs::create_dir_all(&base).unwrap();
+        let state_path = base.join("state.json");
+        let niri_config_path = base.join("config.kdl");
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "demo".to_string(),
+            ProjectRecord {
+                name: "demo".to_string(),
+                path: base.display().to_string(),
+                workspace: "demo".to_string(),
+                port: 3001,
+            },
+        );
+        let mut state = AppState {
+            projects,
+            focused_project: None,
+            suspended_projects: HashSet::new(),
+            state_path,
+            niri_config_path,
+            logs_path: base.join("logs"),
+            browser_profile_root: base.join("browser-profiles"),
+            router_port: DEFAULT_ROUTER_PORT,
+            router_routes: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_processes: BTreeMap::new(),
+        };
+
+        let result = state.focus("demo").unwrap();
+        assert!(!result.workspace_focused);
+        assert!(!result.windows_surfaced);
+        assert_eq!(result.status.project.name, "demo");
+        assert!(!result.warnings.is_empty());
+
+        restore_env("PROJD_NIRI_BIN", previous_niri);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn send_runtime_exit_notification_includes_focus_hint() {
+        let context = RuntimeExitNotification {
+            project_name: "frontend".to_string(),
+            process_name: "server".to_string(),
+            success: false,
+            exit_status: std::process::ExitStatus::from_raw(256).to_string(),
+        };
+
+        let title = format!(
+            "{}: {}",
+            context.project_name,
+            if context.success {
+                "process exited"
+            } else {
+                "process failed"
+            }
+        );
+        let body = format!(
+            "process: {}\nstatus: {}\nrun `proj focus {}` to jump back",
+            context.process_name, context.exit_status, context.project_name
+        );
+
+        assert_eq!(title, "frontend: process failed");
+        assert!(body.contains("process: server"));
+        assert!(body.contains("proj focus frontend"));
+    }
+
+    #[test]
+    fn poll_runtime_events_handles_missing_notifier_without_panicking() {
+        let _guard = env_lock().lock().unwrap();
+        let previous_notifier = std::env::var_os("PROJD_NOTIFY_BIN");
+        std::env::set_var("PROJD_NOTIFY_BIN", "command-that-does-not-exist");
+
+        let base = unique_temp_dir("poll-runtime-events");
+        fs::create_dir_all(&base).unwrap();
+        let child = Command::new("sh")
+            .arg("-lc")
+            .arg("exit 1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "demo".to_string(),
+            ProjectRecord {
+                name: "demo".to_string(),
+                path: base.display().to_string(),
+                workspace: "demo".to_string(),
+                port: 3001,
+            },
+        );
+        let mut runtime_processes = BTreeMap::new();
+        runtime_processes.insert(
+            "demo".to_string(),
+            vec![RuntimeProcess {
+                name: "server".to_string(),
+                log_path: base.join("server.log"),
+                child,
+            }],
+        );
+        let mut state = AppState {
+            projects,
+            focused_project: None,
+            suspended_projects: HashSet::new(),
+            state_path: base.join("state.json"),
+            niri_config_path: base.join("config.kdl"),
+            logs_path: base.join("logs"),
+            browser_profile_root: base.join("browser-profiles"),
+            router_port: DEFAULT_ROUTER_PORT,
+            router_routes: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_processes,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            state.poll_runtime_events();
+            if state.runtime_processes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(state.runtime_processes.is_empty());
+
+        restore_env("PROJD_NOTIFY_BIN", previous_notifier);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

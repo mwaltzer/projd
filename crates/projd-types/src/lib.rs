@@ -9,6 +9,7 @@ pub const METHOD_UP: &str = "up";
 pub const METHOD_DOWN: &str = "down";
 pub const METHOD_LIST: &str = "list";
 pub const METHOD_SWITCH: &str = "switch";
+pub const METHOD_FOCUS: &str = "focus";
 pub const METHOD_SUSPEND: &str = "suspend";
 pub const METHOD_RESUME: &str = "resume";
 pub const METHOD_PEEK: &str = "peek";
@@ -17,6 +18,8 @@ pub const METHOD_LOGS: &str = "logs";
 
 pub const NIRI_MANAGED_START: &str = "// === PROJD MANAGED START (do not edit) ===";
 pub const NIRI_MANAGED_END: &str = "// === PROJD MANAGED END ===";
+pub const NIRI_INTEGRATION_START: &str = "// === PROJD NIRI INTEGRATION START (do not edit) ===";
+pub const NIRI_INTEGRATION_END: &str = "// === PROJD NIRI INTEGRATION END ===";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -123,6 +126,15 @@ pub struct ProjectStatus {
     pub project: ProjectRecord,
     pub state: ProjectLifecycleState,
     pub focused: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FocusResult {
+    pub status: ProjectStatus,
+    pub workspace_focused: bool,
+    pub windows_surfaced: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
