@@ -89,6 +89,7 @@ fn main() -> Result<()> {
 
     info!("projd listening on {}", socket_path.display());
     let running = Arc::new(AtomicBool::new(true));
+    install_signal_handler(running.clone());
     let router_running = running.clone();
     let router_handle = thread::spawn(move || {
         run_host_router(router_listener, router_routes, router_running, router_port)
@@ -128,6 +129,37 @@ fn init_logging() {
                 .unwrap_or_else(|_| "info".to_string()),
         )
         .try_init();
+}
+
+fn install_signal_handler(running: Arc<AtomicBool>) {
+    static SIGNAL_FLAG: AtomicBool = AtomicBool::new(false);
+
+    // Store the Arc's inner pointer so the signal handler can set it.
+    // We leak a clone to keep it alive for the process lifetime.
+    let flag_ptr: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
+    // Wire the leaked flag to the actual running flag via a polling thread.
+    let poll_running = running;
+    // First, stash the pointer so the C handler can reach it.
+    SIGNAL_FLAG.store(true, Ordering::SeqCst);
+
+    extern "C" fn handler(_sig: libc::c_int) {
+        SIGNAL_FLAG.store(false, Ordering::SeqCst);
+    }
+
+    unsafe {
+        libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+    }
+
+    // Background thread polls the signal flag and propagates to Arc<AtomicBool>.
+    thread::spawn(move || {
+        let _ = flag_ptr; // keep alive
+        while SIGNAL_FLAG.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(100));
+        }
+        info!("received signal, initiating graceful shutdown");
+        poll_running.store(false, Ordering::SeqCst);
+    });
 }
 
 fn bind_daemon_socket(socket_path: &Path) -> Result<UnixListener> {
@@ -196,6 +228,9 @@ fn handle_client(
     running: Arc<AtomicBool>,
     app_state: &mut AppState,
 ) -> Result<()> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .context("failed to set client read timeout")?;
     let reader = BufReader::new(
         stream
             .try_clone()
@@ -384,7 +419,7 @@ fn caused_by_io_error_kind(err: &anyhow::Error, kind: io::ErrorKind) -> bool {
 }
 
 fn read_http_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut head = Vec::new();
+    let mut head = Vec::with_capacity(4096);
     let mut chunk = [0_u8; 4096];
     loop {
         let read = stream
@@ -393,8 +428,11 @@ fn read_http_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
         if read == 0 {
             break;
         }
+        let prev_len = head.len();
         head.extend_from_slice(&chunk[..read]);
-        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+        // Only scan the region where the delimiter could newly appear.
+        let scan_start = prev_len.saturating_sub(3);
+        if head[scan_start..].windows(4).any(|w| w == b"\r\n\r\n") {
             return Ok(head);
         }
         if head.len() > ROUTER_HEADER_LIMIT_BYTES {
@@ -876,7 +914,7 @@ impl AppState {
         let mut activation_warnings = Vec::new();
         self.activate_project_in_niri(&project, &mut activation_warnings);
 
-        let runtime = match self.start_runtime_for_project(&project, &project_cfg.runtime) {
+        let mut runtime = match self.start_runtime_for_project(&project, &project_cfg.runtime) {
             Ok(runtime) => runtime,
             Err(err) => {
                 self.projects = previous;
@@ -887,7 +925,6 @@ impl AppState {
                 return Err(err);
             }
         };
-        let mut runtime = runtime;
         activation_warnings.append(&mut runtime.warnings);
 
         Ok(UpResult {
@@ -1150,12 +1187,12 @@ impl AppState {
     fn poll_runtime_events(&mut self) {
         let project_names: Vec<String> = self.runtime_processes.keys().cloned().collect();
         for project_name in project_names {
-            let Some(mut processes) = self.runtime_processes.remove(&project_name) else {
+            let Some(processes) = self.runtime_processes.remove(&project_name) else {
                 continue;
             };
 
             let mut still_running = Vec::new();
-            for mut process in processes.drain(..) {
+            for mut process in processes {
                 match process.child.try_wait() {
                     Ok(Some(status)) => {
                         let workspace_name = self
@@ -1510,6 +1547,7 @@ impl AppState {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create log dir {}", parent.display()))?;
         }
+        use std::os::unix::process::CommandExt;
         let mut child = Command::new("sh")
             .arg("-lc")
             .arg(&spec.command)
@@ -1518,6 +1556,7 @@ impl AppState {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .spawn()
             .with_context(|| {
                 format!(
@@ -1550,14 +1589,14 @@ impl AppState {
     }
 
     fn stop_runtime_for_project(&mut self, name: &str) -> Result<()> {
-        let Some(mut processes) = self.runtime_processes.remove(name) else {
+        let Some(processes) = self.runtime_processes.remove(name) else {
             self.runtime_route_overrides.remove(name);
             let _ = self.sync_router_routes();
             return Ok(());
         };
         let mut failures = Vec::new();
         let mut remaining = Vec::new();
-        for mut process in processes.drain(..) {
+        for mut process in processes {
             if let Err(err) = terminate_child(&mut process.child, Duration::from_secs(2)) {
                 failures.push(format!(
                     "{} ({}): {err}",
@@ -1622,9 +1661,7 @@ impl AppState {
         };
         let data =
             serde_json::to_string_pretty(&state).context("failed to serialize daemon state")?;
-        fs::write(&self.state_path, data).with_context(|| {
-            format!("failed to write state file: {}", self.state_path.display())
-        })?;
+        atomic_write_file(&self.state_path, data.as_bytes())?;
         Ok(())
     }
 
@@ -1651,12 +1688,7 @@ impl AppState {
 
         let managed_fragment = render_niri_fragment(&self.projects);
         let updated = write_managed_section(&current, &managed_fragment)?;
-        fs::write(&self.niri_config_path, updated).with_context(|| {
-            format!(
-                "failed to write niri config file: {}",
-                self.niri_config_path.display()
-            )
-        })?;
+        atomic_write_file(&self.niri_config_path, updated.as_bytes())?;
         Ok(())
     }
 
@@ -2598,6 +2630,25 @@ fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
+fn atomic_write_file(target: &Path, data: &[u8]) -> Result<()> {
+    let parent = target
+        .parent()
+        .with_context(|| format!("cannot determine parent directory for {}", target.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create directory: {}", parent.display()))?;
+    let tmp_path = target.with_extension("tmp");
+    fs::write(&tmp_path, data)
+        .with_context(|| format!("failed to write temporary file: {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, target).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp_path.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn attach_process_logs(child: &mut Child, log_path: &Path) -> Result<()> {
     let file = OpenOptions::new()
         .create(true)
@@ -2650,12 +2701,19 @@ fn terminate_child(child: &mut Child, grace_period: Duration) -> Result<()> {
     #[cfg(unix)]
     {
         let pid = child.id() as i32;
-        // SIGTERM gives spawned processes a chance to flush and exit cleanly.
-        let signal_status = unsafe { libc::kill(pid, libc::SIGTERM) };
+        // Send SIGTERM to the process group so child trees also receive the signal.
+        let signal_status = unsafe { libc::kill(-pid, libc::SIGTERM) };
         if signal_status != 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::ESRCH) {
-                return Err(err).context("failed to send SIGTERM");
+                // Fall back to signaling the process directly.
+                let direct = unsafe { libc::kill(pid, libc::SIGTERM) };
+                if direct != 0 {
+                    let direct_err = std::io::Error::last_os_error();
+                    if direct_err.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(direct_err).context("failed to send SIGTERM");
+                    }
+                }
             }
         }
     }
