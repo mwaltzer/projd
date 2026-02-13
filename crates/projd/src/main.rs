@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::path::PathBuf;
@@ -2400,6 +2400,11 @@ fn is_port_reachable(port: u16) -> bool {
         Duration::from_millis(60),
     )
     .is_ok()
+        || TcpStream::connect_timeout(
+            &SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+            Duration::from_millis(60),
+        )
+        .is_ok()
 }
 
 fn runtime_ready_timeout() -> Duration {
