@@ -11,11 +11,12 @@ use projd_types::{
     METHOD_FOCUS, METHOD_LOGS, METHOD_PEEK, METHOD_PING, METHOD_RESUME, METHOD_STATUS,
     METHOD_SUSPEND, METHOD_SWITCH, METHOD_UP,
 };
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,8 @@ struct App {
     logs: String,
     status_message: String,
     follow_logs: bool,
+    show_help: bool,
+    log_scroll: u16,
 }
 
 impl App {
@@ -84,19 +87,11 @@ impl App {
     }
 
     fn select_first(&mut self) {
-        if self.projects.is_empty() {
-            self.selected = 0;
-            return;
-        }
         self.selected = 0;
     }
 
     fn select_last(&mut self) {
-        if self.projects.is_empty() {
-            self.selected = 0;
-            return;
-        }
-        self.selected = self.projects.len() - 1;
+        self.selected = self.projects.len().saturating_sub(1);
     }
 }
 
@@ -120,7 +115,7 @@ fn main() -> Result<()> {
     )
 }
 
-fn resolve_autostart(autostart: bool, no_autostart: bool) -> bool {
+const fn resolve_autostart(autostart: bool, no_autostart: bool) -> bool {
     autostart && !no_autostart
 }
 
@@ -149,7 +144,7 @@ fn run_tui(socket_path: &Path, autostart: bool, refresh_ms: u64) -> Result<()> {
             let event = event::read().context("failed to read terminal event")?;
             if let Event::Key(key) = event {
                 if key.kind == KeyEventKind::Press
-                    && handle_key(key.code, socket_path, autostart, &mut app)?
+                    && handle_key(key, socket_path, autostart, &mut app)?
                 {
                     break;
                 }
@@ -181,7 +176,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
     .split(frame.area());
 
     let help = Paragraph::new(
-        "q quit | j/k move | g/G first/last | enter focus | p peek | r refresh | u up(cwd) | s switch | z suspend | e resume | d down | l logs | f follow logs",
+        "q quit | j/k move | g/G first/last | enter focus | p peek | r refresh | u up(cwd) | s switch | z suspend | e resume | d down | l logs | f follow | ? help",
     );
     frame.render_widget(help, chunks[0]);
 
@@ -191,13 +186,23 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
         frame.render_widget(empty, chunks[1]);
     } else {
         let rows = app.projects.iter().map(|status| {
+            let state_color = match status.state {
+                ProjectLifecycleState::Active => Color::Green,
+                ProjectLifecycleState::Backgrounded => Color::Yellow,
+                ProjectLifecycleState::Suspended => Color::DarkGray,
+            };
+            let mut style = Style::default().fg(state_color);
+            if status.focused {
+                style = style.add_modifier(Modifier::BOLD);
+            }
             Row::new([
-                Cell::from(status.project.name.clone()),
+                Cell::from(status.project.name.as_str()),
                 Cell::from(lifecycle_state_label(&status.state)),
                 Cell::from(if status.focused { "yes" } else { "no" }),
                 Cell::from(status.project.port.to_string()),
-                Cell::from(status.project.workspace.clone()),
+                Cell::from(status.project.workspace.as_str()),
             ])
+            .style(style)
         });
         let table = Table::new(
             rows,
@@ -219,17 +224,102 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
         frame.render_stateful_widget(table, chunks[1], &mut state);
     }
 
+    let log_title = if app.follow_logs {
+        if let Some(name) = app.selected_project_name() {
+            format!("Logs: {name} (following)")
+        } else {
+            "Logs (following)".to_string()
+        }
+    } else if let Some(name) = app.selected_project_name() {
+        if !app.logs.is_empty() {
+            format!("Logs: {name}")
+        } else {
+            "Logs".to_string()
+        }
+    } else {
+        "Logs".to_string()
+    };
+
     let logs = Paragraph::new(app.logs.as_str())
-        .block(Block::default().title("Logs").borders(Borders::ALL));
+        .block(Block::default().title(log_title).borders(Borders::ALL))
+        .scroll((app.log_scroll, 0));
     frame.render_widget(logs, chunks[2]);
-    let status = Paragraph::new(app.status_message.as_str());
+
+    let status_line = if app.status_message.is_empty() {
+        format!(
+            "{} projects | follow: {}",
+            app.projects.len(),
+            if app.follow_logs { "on" } else { "off" }
+        )
+    } else {
+        format!("{} | {} projects", app.status_message, app.projects.len())
+    };
+    let status = Paragraph::new(status_line);
     frame.render_widget(status, chunks[3]);
+
+    if app.show_help {
+        let area = frame.area();
+        let overlay = centered_rect(60, 70, area);
+        frame.render_widget(Clear, overlay);
+        let help_text = "\
+Keybindings:
+
+  j / k        Navigate down / up
+  g / G        Jump to first / last
+  Enter        Focus selected project
+  s            Switch to selected project
+  u            Up (register cwd)
+  d            Down (remove project)
+  z            Suspend selected project
+  e            Resume selected project
+  p            Peek at selected project
+  l            Load logs for selected project
+  f            Toggle log following
+  r            Refresh status
+  PageUp/Down  Scroll logs
+  ?            Toggle this help overlay
+  Ctrl+C / q   Quit";
+        let help_paragraph = Paragraph::new(help_text)
+            .block(Block::default().title("Help").borders(Borders::ALL))
+            .style(Style::default().fg(Color::White));
+        frame.render_widget(help_paragraph, overlay);
+    }
 }
 
-fn handle_key(code: KeyCode, socket_path: &Path, autostart: bool, app: &mut App) -> Result<bool> {
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::vertical([
+        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100 - percent_y) / 2),
+    ])
+    .split(r);
+    Layout::horizontal([
+        Constraint::Percentage((100 - percent_x) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(popup_layout[1])[1]
+}
+
+fn handle_key(
+    key: crossterm::event::KeyEvent,
+    socket_path: &Path,
+    autostart: bool,
+    app: &mut App,
+) -> Result<bool> {
     let mut selection_changed = false;
-    match code {
+    match key.code {
         KeyCode::Char('q') => return Ok(true),
+        KeyCode::Char('c')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            return Ok(true);
+        }
+        KeyCode::Char('?') => {
+            app.show_help = !app.show_help;
+        }
         KeyCode::Char('j') | KeyCode::Down => {
             app.select_next();
             selection_changed = true;
@@ -246,6 +336,12 @@ fn handle_key(code: KeyCode, socket_path: &Path, autostart: bool, app: &mut App)
             app.select_last();
             selection_changed = true;
         }
+        KeyCode::PageDown => {
+            app.log_scroll = app.log_scroll.saturating_add(10);
+        }
+        KeyCode::PageUp => {
+            app.log_scroll = app.log_scroll.saturating_sub(10);
+        }
         KeyCode::Enter => {
             invoke_selected_name_action(socket_path, METHOD_FOCUS, autostart, app)?;
         }
@@ -253,10 +349,7 @@ fn handle_key(code: KeyCode, socket_path: &Path, autostart: bool, app: &mut App)
             invoke_selected_name_action(socket_path, METHOD_PEEK, autostart, app)?;
         }
         KeyCode::Char('r') => {
-            refresh_status(socket_path, autostart, app)?;
-            if app.follow_logs {
-                load_selected_logs(socket_path, autostart, app)?;
-            }
+            refresh_all(socket_path, autostart, app)?;
             app.status_message = "refreshed status".to_string();
         }
         KeyCode::Char('u') => {
@@ -273,10 +366,7 @@ fn handle_key(code: KeyCode, socket_path: &Path, autostart: bool, app: &mut App)
             )?;
             let result: projd_types::UpResult = parse_ok_response(response)?;
             app.status_message = format!("up {} (created={})", result.project.name, result.created);
-            refresh_status(socket_path, autostart, app)?;
-            if app.follow_logs {
-                load_selected_logs(socket_path, autostart, app)?;
-            }
+            refresh_all(socket_path, autostart, app)?;
         }
         KeyCode::Char('s') => {
             invoke_selected_name_action(socket_path, METHOD_SWITCH, autostart, app)?;
@@ -301,10 +391,7 @@ fn handle_key(code: KeyCode, socket_path: &Path, autostart: bool, app: &mut App)
             )?;
             let removed: projd_types::ProjectRecord = parse_ok_response(response)?;
             app.status_message = format!("down {}", removed.name);
-            refresh_status(socket_path, autostart, app)?;
-            if app.follow_logs {
-                load_selected_logs(socket_path, autostart, app)?;
-            }
+            refresh_all(socket_path, autostart, app)?;
         }
         KeyCode::Char('l') => {
             load_selected_logs(socket_path, autostart, app)?;
@@ -349,6 +436,11 @@ fn invoke_selected_name_action(
     )?;
     let _: ProjectStatus = parse_ok_response(response)?;
     app.status_message = format!("{method} {name}");
+    refresh_all(socket_path, autostart, app)?;
+    Ok(())
+}
+
+fn refresh_all(socket_path: &Path, autostart: bool, app: &mut App) -> Result<()> {
     refresh_status(socket_path, autostart, app)?;
     if app.follow_logs {
         load_selected_logs(socket_path, autostart, app)?;
@@ -390,7 +482,8 @@ fn load_selected_logs(socket_path: &Path, autostart: bool, app: &mut App) -> Res
     )?;
     let logs: LogsResult = parse_ok_response(response)?;
     app.logs = render_logs(&logs);
-    app.status_message = format!("loaded logs for {}", name);
+    app.log_scroll = 0;
+    app.status_message = format!("loaded logs for {name}");
     Ok(())
 }
 
@@ -405,7 +498,7 @@ fn render_logs(logs: &LogsResult) -> String {
             if index > 0 {
                 output.push('\n');
             }
-            output.push_str(format!("== {} ({}) ==\n", entry.process, entry.path).as_str());
+            let _ = writeln!(output, "== {} ({}) ==", entry.process, entry.path);
         }
         output.push_str(entry.content.as_str());
         if !entry.content.ends_with('\n') {
@@ -415,7 +508,7 @@ fn render_logs(logs: &LogsResult) -> String {
     output
 }
 
-fn lifecycle_state_label(state: &ProjectLifecycleState) -> &'static str {
+const fn lifecycle_state_label(state: &ProjectLifecycleState) -> &'static str {
     match state {
         ProjectLifecycleState::Active => "active",
         ProjectLifecycleState::Backgrounded => "backgrounded",
@@ -550,12 +643,12 @@ fn detect_local_projd_binary() -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn projd_binary_name() -> &'static str {
+const fn projd_binary_name() -> &'static str {
     "projd"
 }
 
 #[cfg(windows)]
-fn projd_binary_name() -> &'static str {
+const fn projd_binary_name() -> &'static str {
     "projd.exe"
 }
 
@@ -575,6 +668,8 @@ mod tests {
             logs: String::new(),
             status_message: String::new(),
             follow_logs: false,
+            show_help: false,
+            log_scroll: 0,
         };
         app.set_projects(vec![status("a", ProjectLifecycleState::Active)]);
         assert_eq!(app.selected, 0);
