@@ -1131,8 +1131,14 @@ impl AppState {
             for mut process in processes.drain(..) {
                 match process.child.try_wait() {
                     Ok(Some(status)) => {
+                        let workspace_name = self
+                            .projects
+                            .get(&project_name)
+                            .map(|project| project.workspace.clone())
+                            .unwrap_or_else(|| project_name.clone());
                         let context = RuntimeExitNotification {
                             project_name: project_name.clone(),
+                            workspace_name,
                             process_name: process.name.clone(),
                             success: status.success(),
                             exit_status: status.to_string(),
@@ -2447,6 +2453,7 @@ fn sanitize_log_component(raw: &str) -> String {
 #[derive(Debug)]
 struct RuntimeExitNotification {
     project_name: String,
+    workspace_name: String,
     process_name: String,
     success: bool,
     exit_status: String,
@@ -2545,6 +2552,28 @@ fn workspace_id_from_niri(workspace: &str) -> Option<u64> {
     })
 }
 
+fn workspace_index_from_niri(workspace: &str) -> Option<u64> {
+    let output = Command::new(niri_binary())
+        .arg("msg")
+        .arg("--json")
+        .arg("workspaces")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let workspaces = value.as_array()?;
+    workspaces.iter().find_map(|item| {
+        let object = item.as_object()?;
+        let name = object.get("name")?.as_str()?;
+        if name != workspace {
+            return None;
+        }
+        object.get("idx")?.as_u64()
+    })
+}
+
 fn active_or_first_window_id_from_niri(workspace_id: u64) -> Option<u64> {
     if let Some(active) = active_window_id_from_niri_workspace(workspace_id) {
         return Some(active);
@@ -2638,9 +2667,13 @@ fn send_runtime_exit_notification(context: &RuntimeExitNotification) -> Result<(
             "process failed"
         }
     );
+    let workspace = format_workspace_for_notification(
+        &context.workspace_name,
+        workspace_index_from_niri(&context.workspace_name),
+    );
     let body = format!(
-        "process: {}\nstatus: {}\nrun `proj focus {}` to jump back",
-        context.process_name, context.exit_status, context.project_name
+        "workspace: {workspace}\nprocess: {}\nstatus: {}",
+        context.process_name, context.exit_status
     );
     let output = Command::new(notifier_binary())
         .arg(title)
@@ -2659,6 +2692,13 @@ fn send_runtime_exit_notification(context: &RuntimeExitNotification) -> Result<(
         "desktop notifier exited with status {}: {stderr}",
         output.status
     );
+}
+
+fn format_workspace_for_notification(workspace_name: &str, index: Option<u64>) -> String {
+    match index {
+        Some(index) => format!("{workspace_name} (#{index})"),
+        None => workspace_name.to_string(),
+    }
 }
 
 fn should_notify_runtime_exit(context: &RuntimeExitNotification) -> bool {
@@ -3271,9 +3311,10 @@ urls = [\"http://localhost:${PORT}\"]\n",
     }
 
     #[test]
-    fn send_runtime_exit_notification_includes_focus_hint() {
+    fn runtime_exit_notification_mentions_workspace_context() {
         let context = RuntimeExitNotification {
             project_name: "frontend".to_string(),
+            workspace_name: "context-systems".to_string(),
             process_name: "server".to_string(),
             success: false,
             exit_status: std::process::ExitStatus::from_raw(256).to_string(),
@@ -3288,38 +3329,56 @@ urls = [\"http://localhost:${PORT}\"]\n",
                 "process failed"
             }
         );
+        let workspace = format_workspace_for_notification(&context.workspace_name, Some(2));
         let body = format!(
-            "process: {}\nstatus: {}\nrun `proj focus {}` to jump back",
-            context.process_name, context.exit_status, context.project_name
+            "workspace: {workspace}\nprocess: {}\nstatus: {}",
+            context.process_name, context.exit_status
         );
 
         assert_eq!(title, "frontend: process failed");
+        assert!(body.contains("workspace: context-systems (#2)"));
         assert!(body.contains("process: server"));
-        assert!(body.contains("proj focus frontend"));
+        assert!(body.contains("status: exit status: 1"));
+    }
+
+    #[test]
+    fn format_workspace_for_notification_handles_optional_index() {
+        assert_eq!(
+            format_workspace_for_notification("context-systems", Some(2)),
+            "context-systems (#2)"
+        );
+        assert_eq!(
+            format_workspace_for_notification("context-systems", None),
+            "context-systems"
+        );
     }
 
     #[test]
     fn should_notify_runtime_exit_filters_successful_low_signal_processes() {
         let server_success = RuntimeExitNotification {
             project_name: "demo".to_string(),
+            workspace_name: "demo".to_string(),
             process_name: "server".to_string(),
             success: true,
             exit_status: "exit status: 0".to_string(),
         };
         let agent_success = RuntimeExitNotification {
             project_name: "demo".to_string(),
+            workspace_name: "demo".to_string(),
             process_name: "agent-indexer".to_string(),
             success: true,
             exit_status: "exit status: 0".to_string(),
         };
         let terminal_success = RuntimeExitNotification {
             project_name: "demo".to_string(),
+            workspace_name: "demo".to_string(),
             process_name: "terminal-dev".to_string(),
             success: true,
             exit_status: "exit status: 0".to_string(),
         };
         let terminal_failure = RuntimeExitNotification {
             project_name: "demo".to_string(),
+            workspace_name: "demo".to_string(),
             process_name: "terminal-dev".to_string(),
             success: false,
             exit_status: "exit status: 1".to_string(),
