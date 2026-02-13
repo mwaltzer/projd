@@ -1137,11 +1137,13 @@ impl AppState {
                             success: status.success(),
                             exit_status: status.to_string(),
                         };
-                        if let Err(err) = send_runtime_exit_notification(&context) {
-                            warn!(
-                                "failed to send runtime exit notification for project '{}', process '{}': {err}",
-                                context.project_name, context.process_name
-                            );
+                        if should_notify_runtime_exit(&context) {
+                            if let Err(err) = send_runtime_exit_notification(&context) {
+                                warn!(
+                                    "failed to send runtime exit notification for project '{}', process '{}': {err}",
+                                    context.project_name, context.process_name
+                                );
+                            }
                         }
                     }
                     Ok(None) => still_running.push(process),
@@ -2659,6 +2661,13 @@ fn send_runtime_exit_notification(context: &RuntimeExitNotification) -> Result<(
     );
 }
 
+fn should_notify_runtime_exit(context: &RuntimeExitNotification) -> bool {
+    if !context.success {
+        return true;
+    }
+    context.process_name == "server" || context.process_name.starts_with("agent-")
+}
+
 fn find_workspace_name(value: &Value) -> Option<String> {
     match value {
         Value::Object(map) => {
@@ -2690,6 +2699,7 @@ fn find_workspace_name(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3289,6 +3299,39 @@ urls = [\"http://localhost:${PORT}\"]\n",
     }
 
     #[test]
+    fn should_notify_runtime_exit_filters_successful_low_signal_processes() {
+        let server_success = RuntimeExitNotification {
+            project_name: "demo".to_string(),
+            process_name: "server".to_string(),
+            success: true,
+            exit_status: "exit status: 0".to_string(),
+        };
+        let agent_success = RuntimeExitNotification {
+            project_name: "demo".to_string(),
+            process_name: "agent-indexer".to_string(),
+            success: true,
+            exit_status: "exit status: 0".to_string(),
+        };
+        let terminal_success = RuntimeExitNotification {
+            project_name: "demo".to_string(),
+            process_name: "terminal-dev".to_string(),
+            success: true,
+            exit_status: "exit status: 0".to_string(),
+        };
+        let terminal_failure = RuntimeExitNotification {
+            project_name: "demo".to_string(),
+            process_name: "terminal-dev".to_string(),
+            success: false,
+            exit_status: "exit status: 1".to_string(),
+        };
+
+        assert!(should_notify_runtime_exit(&server_success));
+        assert!(should_notify_runtime_exit(&agent_success));
+        assert!(!should_notify_runtime_exit(&terminal_success));
+        assert!(should_notify_runtime_exit(&terminal_failure));
+    }
+
+    #[test]
     fn poll_runtime_events_handles_missing_notifier_without_panicking() {
         let _guard = env_lock().lock().unwrap();
         let previous_notifier = std::env::var_os("PROJD_NOTIFY_BIN");
@@ -3346,6 +3389,103 @@ urls = [\"http://localhost:${PORT}\"]\n",
             thread::sleep(Duration::from_millis(20));
         }
         assert!(state.runtime_processes.is_empty());
+
+        restore_env("PROJD_NOTIFY_BIN", previous_notifier);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn poll_runtime_events_skips_clean_terminal_notifications() {
+        let _guard = env_lock().lock().unwrap();
+        let previous_notifier = std::env::var_os("PROJD_NOTIFY_BIN");
+
+        let base = unique_temp_dir("poll-runtime-events-filtered");
+        fs::create_dir_all(&base).unwrap();
+        let notify_log = base.join("notify.log");
+        let notify_script = base.join("notify.sh");
+        fs::write(
+            &notify_script,
+            format!(
+                "#!/usr/bin/env sh\nset -eu\nprintf '%s\\n' \"$1\" >> \"{}\"\n",
+                notify_log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&notify_script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&notify_script, perms).unwrap();
+        std::env::set_var("PROJD_NOTIFY_BIN", notify_script.display().to_string());
+
+        let success_child = Command::new("sh")
+            .arg("-lc")
+            .arg("exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let failure_child = Command::new("sh")
+            .arg("-lc")
+            .arg("exit 1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "demo".to_string(),
+            ProjectRecord {
+                name: "demo".to_string(),
+                path: base.display().to_string(),
+                workspace: "demo".to_string(),
+                port: 3001,
+            },
+        );
+        let mut runtime_processes = BTreeMap::new();
+        runtime_processes.insert(
+            "demo".to_string(),
+            vec![
+                RuntimeProcess {
+                    name: "terminal-dev".to_string(),
+                    log_path: base.join("terminal.log"),
+                    child: success_child,
+                },
+                RuntimeProcess {
+                    name: "terminal-ci".to_string(),
+                    log_path: base.join("terminal-ci.log"),
+                    child: failure_child,
+                },
+            ],
+        );
+        let mut state = AppState {
+            projects,
+            focused_project: None,
+            suspended_projects: HashSet::new(),
+            state_path: base.join("state.json"),
+            niri_config_path: base.join("config.kdl"),
+            logs_path: base.join("logs"),
+            browser_profile_root: base.join("browser-profiles"),
+            router_port: DEFAULT_ROUTER_PORT,
+            router_routes: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_processes,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            state.poll_runtime_events();
+            if state.runtime_processes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(state.runtime_processes.is_empty());
+
+        let titles = fs::read_to_string(&notify_log).unwrap_or_default();
+        assert_eq!(titles.lines().count(), 1);
+        assert!(titles.contains("demo: process failed"));
+        assert!(!titles.contains("process exited"));
 
         restore_env("PROJD_NOTIFY_BIN", previous_notifier);
         let _ = fs::remove_dir_all(&base);

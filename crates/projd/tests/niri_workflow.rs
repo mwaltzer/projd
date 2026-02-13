@@ -359,6 +359,12 @@ echo \"$*\" >> \"{}\"\n\
 if [ \"$1\" = \"msg\" ] && [ \"$2\" = \"--json\" ] && [ \"$3\" = \"focused-workspace\" ]; then\n\
   echo '{{\"name\":\"focus-demo\"}}'\n\
 fi\n\
+if [ \"$1\" = \"msg\" ] && [ \"$2\" = \"--json\" ] && [ \"$3\" = \"workspaces\" ]; then\n\
+  echo '[{{\"id\":42,\"name\":\"focus-demo\",\"active_window_id\":7}}]'\n\
+fi\n\
+if [ \"$1\" = \"msg\" ] && [ \"$2\" = \"--json\" ] && [ \"$3\" = \"windows\" ]; then\n\
+  echo '[{{\"id\":7,\"workspace_id\":42}}]'\n\
+fi\n\
 exit 0\n",
             niri_log.display()
         ),
@@ -413,7 +419,7 @@ exit 0\n",
 
     let calls = fs::read_to_string(niri_log).unwrap();
     assert!(calls.contains("msg action focus-workspace focus-demo"));
-    assert!(calls.contains("msg action focus-window"));
+    assert!(calls.contains("msg action focus-window --id 7"));
     let _ = fs::remove_dir_all(root);
 }
 
