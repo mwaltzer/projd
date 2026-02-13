@@ -40,6 +40,7 @@ pub struct Response {
 }
 
 impl Response {
+    #[must_use]
     pub fn ok(id: u64, result: Value) -> Self {
         Self {
             id,
@@ -123,6 +124,23 @@ pub enum ProjectLifecycleState {
     Suspended,
 }
 
+impl ProjectLifecycleState {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Backgrounded => "backgrounded",
+            Self::Suspended => "suspended",
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectLifecycleState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectStatus {
     pub project: ProjectRecord,
@@ -166,6 +184,7 @@ pub struct PersistedState {
     pub suspended_projects: Vec<String>,
 }
 
+#[must_use]
 pub fn default_socket_path() -> PathBuf {
     if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
         return PathBuf::from(runtime_dir).join("projd.sock");
@@ -174,6 +193,7 @@ pub fn default_socket_path() -> PathBuf {
     default_data_dir().join("projd.sock")
 }
 
+#[must_use]
 pub fn default_data_dir() -> PathBuf {
     if let Some(data_dir) = dirs::data_local_dir() {
         return data_dir.join("projd");
@@ -182,10 +202,12 @@ pub fn default_data_dir() -> PathBuf {
     PathBuf::from(".projd")
 }
 
+#[must_use]
 pub fn default_state_path() -> PathBuf {
     default_data_dir().join("state.json")
 }
 
+#[must_use]
 pub fn default_niri_config_path() -> PathBuf {
     if let Some(config_dir) = dirs::config_dir() {
         return config_dir.join("niri").join("config.kdl");
