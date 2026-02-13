@@ -88,6 +88,7 @@ Example:
 ```toml
 name = "frontend"
 path = "."
+workspace = "5"
 
 [server]
 command = "npm run dev"
@@ -121,7 +122,7 @@ Runtime env/template variables:
 
 ```bash
 proj init
-proj up [path|name]
+proj up [path|name] [--workspace <workspace>]
 proj down <name>
 proj switch <name>
 proj focus <name>

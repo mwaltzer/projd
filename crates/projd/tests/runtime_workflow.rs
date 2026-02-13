@@ -144,6 +144,7 @@ fn runtime_workflow_collects_logs_and_stops_processes() {
         METHOD_UP,
         serde_json::to_value(UpParams {
             path: project_dir.to_string_lossy().to_string(),
+            workspace: None,
         })
         .expect("failed to serialize up params"),
     )
@@ -245,6 +246,7 @@ cwd = \".\"\n",
         METHOD_UP,
         serde_json::to_value(UpParams {
             path: project_dir.to_string_lossy().to_string(),
+            workspace: None,
         })
         .unwrap(),
     )
@@ -313,6 +315,7 @@ cwd = \".\"\n",
         METHOD_UP,
         serde_json::to_value(UpParams {
             path: app_dir.to_string_lossy().to_string(),
+            workspace: None,
         })
         .unwrap(),
     )
@@ -416,6 +419,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
         METHOD_UP,
         serde_json::to_value(UpParams {
             path: project_dir.to_string_lossy().to_string(),
+            workspace: None,
         })
         .unwrap(),
     )
@@ -471,6 +475,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
         METHOD_UP,
         serde_json::to_value(UpParams {
             path: project_dir.to_string_lossy().to_string(),
+            workspace: None,
         })
         .unwrap(),
     )
@@ -519,6 +524,7 @@ urls = [\"${PROJ_ORIGIN}\"]\n",
         METHOD_UP,
         serde_json::to_value(UpParams {
             path: project_dir.to_string_lossy().to_string(),
+            workspace: None,
         })
         .unwrap(),
     )
@@ -581,6 +587,7 @@ path = \".\"\n",
         METHOD_UP,
         serde_json::to_value(UpParams {
             path: project_dir.to_string_lossy().to_string(),
+            workspace: None,
         })
         .unwrap(),
     )

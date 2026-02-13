@@ -35,6 +35,8 @@ enum Commands {
     Up {
         #[arg(value_name = "PATH_OR_NAME")]
         path: Option<PathBuf>,
+        #[arg(long, value_name = "WORKSPACE")]
+        workspace: Option<String>,
         #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
         autostart: bool,
         #[arg(long = "no-autostart")]
@@ -165,11 +167,13 @@ fn main() -> Result<()> {
         Commands::Init => cmd_init(),
         Commands::Up {
             path,
+            workspace,
             autostart,
             no_autostart,
         } => cmd_up(
             &socket_path,
             path,
+            workspace,
             resolve_autostart(autostart, no_autostart),
         ),
         Commands::Down {
@@ -328,13 +332,19 @@ fn cmd_init() -> Result<()> {
     Ok(())
 }
 
-fn cmd_up(socket_path: &Path, path: Option<PathBuf>, autostart: bool) -> Result<()> {
+fn cmd_up(
+    socket_path: &Path,
+    path: Option<PathBuf>,
+    workspace: Option<String>,
+    autostart: bool,
+) -> Result<()> {
     let project_dir = resolve_project_dir(socket_path, path, autostart)?;
     if let Some(created) = ensure_project_config_exists(&project_dir)? {
         println!("initialized {}", created.display());
     }
     let params = UpParams {
         path: project_dir.to_string_lossy().to_string(),
+        workspace,
     };
     let response = request_with_autostart(
         socket_path,
@@ -925,7 +935,7 @@ fn render_default_project_config(project_dir: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("project");
     format!(
-        "name = \"{name}\"\npath = \"{path}\"\n\n[server]\ncommand = \"cargo run\"\nport_env = \"PORT\"\ncwd = \".\"\n\n[browser]\nurls = [\"${{PROJ_ORIGIN}}\"]\n",
+        "name = \"{name}\"\npath = \"{path}\"\nworkspace = \"{name}\"\n\n[server]\ncommand = \"cargo run\"\nport_env = \"PORT\"\ncwd = \".\"\n\n[browser]\nurls = [\"${{PROJ_ORIGIN}}\"]\n",
         name = default_name,
         path = project_dir.to_string_lossy()
     )
@@ -1175,6 +1185,7 @@ mod tests {
         let content = fs::read_to_string(&toml_path).unwrap();
         assert!(content.contains("name = \""));
         assert!(content.contains("proj-init-create"));
+        assert!(content.contains("workspace = \""));
         assert!(content.contains("command = \"cargo run\""));
 
         let _ = fs::remove_dir_all(&dir);
@@ -1271,6 +1282,20 @@ mod tests {
                 assert_eq!(tail, Some(25));
             }
             _ => panic!("expected logs command"),
+        }
+    }
+
+    #[test]
+    fn up_cli_supports_workspace_override_flag() {
+        let cli = Cli::try_parse_from(["proj", "up", "frontend", "--workspace", "5"]).unwrap();
+        match cli.command {
+            Commands::Up {
+                path, workspace, ..
+            } => {
+                assert_eq!(path, Some(PathBuf::from("frontend")));
+                assert_eq!(workspace.as_deref(), Some("5"));
+            }
+            _ => panic!("expected up command"),
         }
     }
 

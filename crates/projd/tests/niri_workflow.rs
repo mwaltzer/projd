@@ -198,6 +198,7 @@ fn niri_workflow_up_down_round_trip_updates_managed_section() {
         METHOD_UP,
         serde_json::to_value(UpParams {
             path: project_dir.to_string_lossy().to_string(),
+            workspace: None,
         })
         .expect("failed to serialize up params"),
     )
@@ -266,6 +267,82 @@ fn niri_workflow_up_down_round_trip_updates_managed_section() {
 }
 
 #[test]
+fn niri_workflow_up_uses_workspace_from_project_config() {
+    let harness = DaemonHarness::start("");
+    let project_dir = harness.create_project_dir("workspace-config");
+    fs::write(
+        project_dir.join(".project.toml"),
+        "name = \"workspace-config\"\npath = \".\"\nworkspace = \"5\"\n",
+    )
+    .unwrap();
+
+    let up_response = request(
+        &harness.socket_path,
+        METHOD_UP,
+        serde_json::to_value(UpParams {
+            path: project_dir.to_string_lossy().to_string(),
+            workspace: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(up_response.ok, "up failed: {:?}", up_response.error);
+    let up_result: UpResult = serde_json::from_value(up_response.result.unwrap()).unwrap();
+    assert_eq!(up_result.project.workspace, "5");
+}
+
+#[test]
+fn niri_workflow_up_workspace_override_wins_and_updates_existing_registration() {
+    let harness = DaemonHarness::start("");
+    let project_dir = harness.create_project_dir("workspace-override");
+    fs::write(
+        project_dir.join(".project.toml"),
+        "name = \"workspace-override\"\npath = \".\"\nworkspace = \"5\"\n",
+    )
+    .unwrap();
+
+    let first_up = request(
+        &harness.socket_path,
+        METHOD_UP,
+        serde_json::to_value(UpParams {
+            path: project_dir.to_string_lossy().to_string(),
+            workspace: Some("7".to_string()),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(first_up.ok, "first up failed: {:?}", first_up.error);
+    let first_result: UpResult = serde_json::from_value(first_up.result.unwrap()).unwrap();
+    assert_eq!(first_result.project.workspace, "7");
+    assert!(first_result.created);
+
+    let second_up = request(
+        &harness.socket_path,
+        METHOD_UP,
+        serde_json::to_value(UpParams {
+            path: project_dir.to_string_lossy().to_string(),
+            workspace: Some("9".to_string()),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(second_up.ok, "second up failed: {:?}", second_up.error);
+    let second_result: UpResult = serde_json::from_value(second_up.result.unwrap()).unwrap();
+    assert_eq!(second_result.project.workspace, "9");
+    assert!(!second_result.created);
+
+    let list_response = request(&harness.socket_path, METHOD_LIST, Value::Null).unwrap();
+    assert!(list_response.ok);
+    let listed: ListResult = serde_json::from_value(list_response.result.unwrap()).unwrap();
+    let project = listed
+        .projects
+        .iter()
+        .find(|project| project.name == "workspace-override")
+        .expect("missing workspace-override project");
+    assert_eq!(project.workspace, "9");
+}
+
+#[test]
 fn niri_workflow_rejects_partial_markers_without_registering_project() {
     let partial_markers = format!(
         "{start}\nstale managed content\n",
@@ -279,6 +356,7 @@ fn niri_workflow_rejects_partial_markers_without_registering_project() {
         METHOD_UP,
         serde_json::to_value(UpParams {
             path: project_dir.to_string_lossy().to_string(),
+            workspace: None,
         })
         .expect("failed to serialize up params"),
     )
@@ -311,6 +389,7 @@ fn niri_workflow_suspend_transitions_project_state() {
         METHOD_UP,
         serde_json::to_value(UpParams {
             path: project_dir.to_string_lossy().to_string(),
+            workspace: None,
         })
         .expect("failed to serialize up params"),
     )
@@ -391,6 +470,7 @@ exit 0\n",
         METHOD_UP,
         serde_json::to_value(UpParams {
             path: project_dir.to_string_lossy().to_string(),
+            workspace: None,
         })
         .unwrap(),
     )
@@ -438,6 +518,7 @@ fn niri_workflow_focus_returns_warnings_when_niri_is_unavailable() {
         METHOD_UP,
         serde_json::to_value(UpParams {
             path: project_dir.to_string_lossy().to_string(),
+            workspace: None,
         })
         .unwrap(),
     )

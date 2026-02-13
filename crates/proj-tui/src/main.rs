@@ -266,6 +266,7 @@ fn handle_key(code: KeyCode, socket_path: &Path, autostart: bool, app: &mut App)
                 METHOD_UP,
                 serde_json::to_value(UpParams {
                     path: cwd.to_string_lossy().to_string(),
+                    workspace: None,
                 })
                 .context("failed to serialize up params")?,
                 autostart,

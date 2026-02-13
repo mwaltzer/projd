@@ -62,6 +62,8 @@ impl Response {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpParams {
     pub path: String,
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

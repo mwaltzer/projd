@@ -624,6 +624,7 @@ struct RuntimeProcess {
 struct LoadedProjectConfig {
     name: String,
     path: PathBuf,
+    workspace: Option<String>,
     runtime: RuntimeConfig,
 }
 
@@ -766,6 +767,11 @@ impl AppState {
         params: UpParams,
         resolving_paths: &mut HashSet<PathBuf>,
     ) -> Result<UpResult> {
+        let workspace_override = params
+            .workspace
+            .as_deref()
+            .map(|workspace| validate_workspace_name(workspace, "up.workspace"))
+            .transpose()?;
         let project_dir = fs::canonicalize(&params.path)
             .with_context(|| format!("failed to resolve project path: {}", params.path))?;
         if !project_dir.is_dir() {
@@ -778,7 +784,8 @@ impl AppState {
             );
         }
 
-        let result = self.up_internal_once(project_dir.clone(), resolving_paths);
+        let result =
+            self.up_internal_once(project_dir.clone(), workspace_override, resolving_paths);
         resolving_paths.remove(&project_dir);
         result
     }
@@ -786,17 +793,33 @@ impl AppState {
     fn up_internal_once(
         &mut self,
         project_dir: PathBuf,
+        workspace_override: Option<String>,
         resolving_paths: &mut HashSet<PathBuf>,
     ) -> Result<UpResult> {
         let project_cfg = load_project_config(&project_dir)?;
         let project_name = project_cfg.name.clone();
         self.ensure_dependencies_for(&project_cfg, resolving_paths)?;
+        let desired_workspace = resolved_project_workspace(
+            &project_name,
+            project_cfg.workspace.as_deref(),
+            workspace_override.as_deref(),
+        )?;
+        self.ensure_workspace_available(&project_name, &desired_workspace)?;
 
         let project_path = path_to_string(&project_cfg.path);
 
         if let Some(existing) = self.projects.get(&project_name) {
             if existing.path == project_path {
-                let existing = existing.clone();
+                let mut existing = existing.clone();
+                if existing.workspace != desired_workspace {
+                    let previous_projects = self.projects.clone();
+                    existing.workspace = desired_workspace;
+                    self.projects.insert(project_name.clone(), existing.clone());
+                    if let Err(err) = self.sync() {
+                        self.projects = previous_projects;
+                        return Err(err);
+                    }
+                }
                 let mut activation_warnings = Vec::new();
                 self.activate_project_in_niri(&existing, &mut activation_warnings);
                 let mut runtime = self.ensure_runtime_for_project(&existing, &project_cfg)?;
@@ -832,7 +855,7 @@ impl AppState {
         let project = ProjectRecord {
             name: project_name.clone(),
             path: project_path,
-            workspace: project_name.clone(),
+            workspace: desired_workspace,
             port: self.allocate_port()?,
         };
 
@@ -1175,6 +1198,21 @@ impl AppState {
             .ok_or_else(|| anyhow::anyhow!("project '{}' is not registered", name))
     }
 
+    fn ensure_workspace_available(&self, project_name: &str, workspace: &str) -> Result<()> {
+        if let Some(conflict) = self
+            .projects
+            .iter()
+            .find(|(name, project)| name.as_str() != project_name && project.workspace == workspace)
+        {
+            bail!(
+                "workspace '{}' is already assigned to project '{}'",
+                workspace,
+                conflict.0
+            );
+        }
+        Ok(())
+    }
+
     fn project_status(&self, project: &ProjectRecord) -> ProjectStatus {
         let suspended = self.suspended_projects.contains(project.name.as_str());
         let focused = !suspended && self.focused_project.as_deref() == Some(project.name.as_str());
@@ -1252,6 +1290,7 @@ impl AppState {
                         let _ = self.up_internal(
                             UpParams {
                                 path: path_to_string(path),
+                                workspace: None,
                             },
                             resolving_paths,
                         )?;
@@ -1543,6 +1582,8 @@ struct RawProjectConfig {
     name: String,
     path: String,
     #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
     depends_on: Vec<String>,
     #[serde(default)]
     server: Option<RawServerConfig>,
@@ -1618,12 +1659,18 @@ fn load_project_config(project_dir: &Path) -> Result<LoadedProjectConfig> {
     if name.is_empty() {
         bail!("project name in .project.toml cannot be empty");
     }
+    let workspace = parsed
+        .workspace
+        .as_deref()
+        .map(|value| validate_workspace_name(value, "workspace"))
+        .transpose()?;
 
     let normalized_path = normalize_project_path(&parsed.path, project_dir)?;
     let runtime = build_runtime_config(&parsed, &normalized_path)?;
     Ok(LoadedProjectConfig {
         name,
         path: normalized_path,
+        workspace,
         runtime,
     })
 }
@@ -1717,6 +1764,24 @@ fn non_empty_field(value: &str, field: &str) -> Result<String> {
         bail!("{field} cannot be empty");
     }
     Ok(trimmed.to_string())
+}
+
+fn validate_workspace_name(value: &str, field: &str) -> Result<String> {
+    non_empty_field(value, field)
+}
+
+fn resolved_project_workspace(
+    project_name: &str,
+    config_workspace: Option<&str>,
+    override_workspace: Option<&str>,
+) -> Result<String> {
+    if let Some(workspace) = override_workspace {
+        return validate_workspace_name(workspace, "up.workspace");
+    }
+    if let Some(workspace) = config_workspace {
+        return validate_workspace_name(workspace, "workspace");
+    }
+    Ok(project_name.to_string())
 }
 
 fn default_true() -> bool {
@@ -2879,6 +2944,7 @@ mod tests {
             base.join(".project.toml"),
             "name = \"demo\"\n\
 path = \".\"\n\
+workspace = \"5\"\n\
 depends_on = [\"./shared\", \"existing-project\"]\n\
 \n\
 [server]\n\
@@ -2904,6 +2970,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
         .unwrap();
 
         let loaded = load_project_config(&base).unwrap();
+        assert_eq!(loaded.workspace.as_deref(), Some("5"));
         let runtime = loaded.runtime;
         assert_eq!(runtime.server.as_ref().unwrap().port_env, "APP_PORT");
         assert_eq!(
@@ -2930,6 +2997,22 @@ urls = [\"http://localhost:${PORT}\"]\n",
         assert_eq!(sanitize_log_component("agent-alpha"), "agent-alpha");
         assert_eq!(sanitize_log_component("agent alpha"), "agent_alpha");
         assert_eq!(sanitize_log_component(".."), "process");
+    }
+
+    #[test]
+    fn resolved_project_workspace_prefers_override_then_config_then_name() {
+        let from_override = resolved_project_workspace("demo", Some("cfg"), Some("7")).unwrap();
+        let from_config = resolved_project_workspace("demo", Some("cfg"), None).unwrap();
+        let from_name = resolved_project_workspace("demo", None, None).unwrap();
+        assert_eq!(from_override, "7");
+        assert_eq!(from_config, "cfg");
+        assert_eq!(from_name, "demo");
+    }
+
+    #[test]
+    fn resolved_project_workspace_rejects_empty_workspace() {
+        let err = resolved_project_workspace("demo", Some("   "), None).unwrap_err();
+        assert!(err.to_string().contains("workspace cannot be empty"));
     }
 
     #[test]
