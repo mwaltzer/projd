@@ -30,6 +30,7 @@ const DEFAULT_ROUTER_PORT: u16 = 48080;
 const ROUTER_HEADER_LIMIT_BYTES: usize = 64 * 1024;
 const ROUTER_MAX_CONCURRENT_STREAMS: usize = 256;
 const ROUTER_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const COMMON_HARDCODED_PORTS: &[u16] = &[3000, 4173, 4200, 4321, 5000, 5173, 5174, 8000, 8080];
 
 #[derive(Debug, Parser)]
 #[command(name = "projd", version, about = "Project daemon for proj CLI")]
@@ -610,6 +611,7 @@ struct AppState {
     browser_profile_root: PathBuf,
     router_port: u16,
     router_routes: Arc<Mutex<BTreeMap<String, u16>>>,
+    runtime_route_overrides: BTreeMap<String, u16>,
     runtime_processes: BTreeMap<String, Vec<RuntimeProcess>>,
 }
 
@@ -753,6 +755,7 @@ impl AppState {
             browser_profile_root,
             router_port,
             router_routes,
+            runtime_route_overrides: BTreeMap::new(),
             runtime_processes: BTreeMap::new(),
         })
     }
@@ -910,6 +913,7 @@ impl AppState {
             .projects
             .remove(&params.name)
             .expect("checked presence above");
+        self.runtime_route_overrides.remove(&params.name);
         self.suspended_projects.remove(&params.name);
         if self.focused_project.as_deref() == Some(params.name.as_str()) {
             self.focused_project = self
@@ -1188,6 +1192,10 @@ impl AppState {
 
             if !still_running.is_empty() {
                 self.runtime_processes.insert(project_name, still_running);
+            } else if self.runtime_route_overrides.remove(&project_name).is_some() {
+                if let Err(err) = self.sync_router_routes() {
+                    warn!("failed to sync router routes after runtime exit: {err}");
+                }
             }
         }
     }
@@ -1314,6 +1322,8 @@ impl AppState {
         )?;
         if specs.is_empty() {
             self.runtime_processes.remove(&project.name);
+            self.runtime_route_overrides.remove(&project.name);
+            let _ = self.sync_router_routes();
             return Ok(RuntimeStartOutcome::default());
         }
 
@@ -1385,10 +1395,90 @@ impl AppState {
             .map(|process| process.name.clone())
             .collect::<Vec<_>>();
         self.runtime_processes.insert(project.name.clone(), started);
+        self.reconcile_server_backend_route(project, config, &mut warnings)?;
         Ok(RuntimeStartOutcome {
             started_processes,
             warnings,
         })
+    }
+
+    fn reconcile_server_backend_route(
+        &mut self,
+        project: &ProjectRecord,
+        config: &RuntimeConfig,
+        warnings: &mut Vec<String>,
+    ) -> Result<()> {
+        let had_override = self.runtime_route_overrides.remove(&project.name).is_some();
+        if config.server.is_none() {
+            if had_override {
+                self.sync_router_routes()?;
+            }
+            return Ok(());
+        }
+
+        let mut blocked_ports: HashSet<u16> = self
+            .projects
+            .values()
+            .filter(|item| item.name != project.name)
+            .map(|item| item.port)
+            .collect();
+        blocked_ports.extend(
+            self.runtime_route_overrides
+                .iter()
+                .filter(|(name, _)| name.as_str() != project.name)
+                .map(|(_, port)| *port),
+        );
+
+        let deadline = Instant::now() + runtime_bind_probe_timeout();
+        loop {
+            let selection = select_backend_port(project.port, &blocked_ports, is_port_reachable);
+            match selection {
+                BackendPortSelection::Expected => {
+                    if had_override {
+                        self.sync_router_routes()?;
+                    }
+                    return Ok(());
+                }
+                BackendPortSelection::Fallback(port) => {
+                    self.runtime_route_overrides
+                        .insert(project.name.clone(), port);
+                    self.sync_router_routes()?;
+                    warnings.push(format!(
+                        "server did not bind assigned port {}; routed '{}' to detected localhost:{} (likely hardcoded port). Prefer using $PORT",
+                        project.port, project.name, port
+                    ));
+                    return Ok(());
+                }
+                BackendPortSelection::Ambiguous(ports) => {
+                    warnings.push(format!(
+                        "server did not bind assigned port {} and multiple fallback ports are reachable ({}); keeping default routing",
+                        project.port,
+                        ports
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                    if had_override {
+                        self.sync_router_routes()?;
+                    }
+                    return Ok(());
+                }
+                BackendPortSelection::Unknown => {
+                    if Instant::now() >= deadline {
+                        warnings.push(format!(
+                            "server did not bind assigned port {} during startup probe; routing may fail if command hardcodes localhost/port",
+                            project.port
+                        ));
+                        if had_override {
+                            self.sync_router_routes()?;
+                        }
+                        return Ok(());
+                    }
+                    thread::sleep(Duration::from_millis(80));
+                }
+            }
+        }
     }
 
     fn activate_project_in_niri(&mut self, project: &ProjectRecord, warnings: &mut Vec<String>) {
@@ -1461,6 +1551,8 @@ impl AppState {
 
     fn stop_runtime_for_project(&mut self, name: &str) -> Result<()> {
         let Some(mut processes) = self.runtime_processes.remove(name) else {
+            self.runtime_route_overrides.remove(name);
+            let _ = self.sync_router_routes();
             return Ok(());
         };
         let mut failures = Vec::new();
@@ -1479,6 +1571,8 @@ impl AppState {
             self.runtime_processes.insert(name.to_string(), remaining);
         }
         if failures.is_empty() {
+            self.runtime_route_overrides.remove(name);
+            let _ = self.sync_router_routes();
             Ok(())
         } else {
             bail!("failed to stop runtime processes: {}", failures.join("; "))
@@ -1567,7 +1661,12 @@ impl AppState {
     }
 
     fn sync_router_routes(&self) -> Result<()> {
-        let routes = compute_router_routes(&self.projects)?;
+        let mut routes = compute_router_routes(&self.projects)?;
+        for (project_name, backend_port) in &self.runtime_route_overrides {
+            if self.projects.contains_key(project_name) {
+                routes.insert(project_local_route_key(project_name), *backend_port);
+            }
+        }
         let mut shared = self
             .router_routes
             .lock()
@@ -1976,6 +2075,10 @@ fn build_runtime_spawn_specs(
 
     for (index, url) in config.browser_urls.iter().enumerate() {
         let interpolated_url = interpolate_runtime_value(url, &interpolation);
+        let normalized_url = normalize_browser_url_to_project_origin(
+            &interpolated_url,
+            &interpolation.project_origin,
+        );
         let open_command = config
             .browser_command
             .as_deref()
@@ -1985,14 +2088,14 @@ fn build_runtime_spawn_specs(
         let profile_dir = browser_profile_dir(browser_profile_root, &project.name);
         let command = build_browser_launch_command(
             &open_command,
-            &interpolated_url,
+            &normalized_url,
             &profile_dir,
             config.browser_isolate_profile,
         );
         let env = browser_runtime_env(
             &base_env,
             &profile_dir,
-            &interpolated_url,
+            &normalized_url,
             config.browser_isolate_profile,
         )?;
         push_runtime_spec(
@@ -2055,6 +2158,27 @@ fn interpolate_runtime_value(value: &str, interpolation: &RuntimeInterpolation) 
         .replace("${PROJ_ORIGIN}", &interpolation.project_origin)
         .replace("${PROJ_URL}", &interpolation.project_origin)
         .replace("${PROJ_ROUTER_PORT}", &router_port)
+}
+
+fn normalize_browser_url_to_project_origin(url: &str, project_origin: &str) -> String {
+    const LOOPBACK_PREFIXES: [&str; 3] = ["http://localhost", "http://127.0.0.1", "http://[::1]"];
+    for prefix in LOOPBACK_PREFIXES {
+        if let Some(remainder) = url.strip_prefix(prefix) {
+            let suffix_start = remainder
+                .char_indices()
+                .find_map(|(index, ch)| {
+                    if ch == '/' || ch == '?' || ch == '#' {
+                        Some(index)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(remainder.len());
+            let suffix = &remainder[suffix_start..];
+            return format!("{project_origin}{suffix}");
+        }
+    }
+    url.to_string()
 }
 
 fn build_shell_command_with_args(command: &str, args: &[String]) -> String {
@@ -2222,6 +2346,60 @@ fn command_has_flag_or_assigned_value(command: &str, flag: &str) -> bool {
     command
         .split_whitespace()
         .any(|token| token == flag || token.starts_with(&assigned_prefix))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BackendPortSelection {
+    Expected,
+    Fallback(u16),
+    Ambiguous(Vec<u16>),
+    Unknown,
+}
+
+fn select_backend_port<F>(
+    expected_port: u16,
+    blocked_ports: &HashSet<u16>,
+    probe: F,
+) -> BackendPortSelection
+where
+    F: Fn(u16) -> bool,
+{
+    if probe(expected_port) {
+        return BackendPortSelection::Expected;
+    }
+
+    let mut reachable = Vec::new();
+    for candidate in COMMON_HARDCODED_PORTS {
+        let candidate = *candidate;
+        if candidate == expected_port || blocked_ports.contains(&candidate) {
+            continue;
+        }
+        if probe(candidate) {
+            reachable.push(candidate);
+        }
+    }
+    match reachable.as_slice() {
+        [single] => BackendPortSelection::Fallback(*single),
+        [] => BackendPortSelection::Unknown,
+        many => BackendPortSelection::Ambiguous(many.to_vec()),
+    }
+}
+
+fn runtime_bind_probe_timeout() -> Duration {
+    if let Ok(raw) = std::env::var("PROJD_BIND_PROBE_TIMEOUT_MS") {
+        if let Ok(parsed) = raw.trim().parse::<u64>() {
+            return Duration::from_millis(parsed.max(100));
+        }
+    }
+    Duration::from_millis(2500)
+}
+
+fn is_port_reachable(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+        Duration::from_millis(60),
+    )
+    .is_ok()
 }
 
 fn runtime_ready_timeout() -> Duration {
@@ -2866,6 +3044,7 @@ mod tests {
             browser_profile_root: PathBuf::from("/tmp/browser-profiles"),
             router_port: DEFAULT_ROUTER_PORT,
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_route_overrides: BTreeMap::new(),
             runtime_processes: BTreeMap::new(),
         };
         assert_eq!(state.allocate_port().unwrap(), 3002);
@@ -2909,6 +3088,7 @@ mod tests {
             browser_profile_root: PathBuf::from("/tmp/browser-profiles"),
             router_port: DEFAULT_ROUTER_PORT,
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_route_overrides: BTreeMap::new(),
             runtime_processes: BTreeMap::new(),
         };
 
@@ -3035,6 +3215,43 @@ urls = [\"http://localhost:${PORT}\"]\n",
     }
 
     #[test]
+    fn normalize_browser_url_to_project_origin_rewrites_loopback_hosts() {
+        let origin = "http://demo.localhost:48080";
+        assert_eq!(
+            normalize_browser_url_to_project_origin(
+                "http://localhost:3000/dashboard?tab=dev",
+                origin
+            ),
+            "http://demo.localhost:48080/dashboard?tab=dev"
+        );
+        assert_eq!(
+            normalize_browser_url_to_project_origin("http://127.0.0.1:5173", origin),
+            "http://demo.localhost:48080"
+        );
+        assert_eq!(
+            normalize_browser_url_to_project_origin("https://localhost:3000", origin),
+            "https://localhost:3000"
+        );
+    }
+
+    #[test]
+    fn select_backend_port_prefers_expected_then_fallbacks() {
+        let blocked = HashSet::new();
+        let expected = select_backend_port(3001, &blocked, |port| port == 3001);
+        assert_eq!(expected, BackendPortSelection::Expected);
+
+        let fallback = select_backend_port(3001, &blocked, |port| port == 3000);
+        assert_eq!(fallback, BackendPortSelection::Fallback(3000));
+
+        let ambiguous = select_backend_port(3001, &blocked, |port| port == 3000 || port == 5173);
+        assert_eq!(ambiguous, BackendPortSelection::Ambiguous(vec![3000, 5173]));
+
+        let blocked_port = HashSet::from([3000_u16]);
+        let unknown = select_backend_port(3001, &blocked_port, |port| port == 3000);
+        assert_eq!(unknown, BackendPortSelection::Unknown);
+    }
+
+    #[test]
     fn project_local_origin_uses_router_port() {
         assert_eq!(
             project_local_host("Context Systems"),
@@ -3137,15 +3354,14 @@ urls = [\"http://localhost:${PORT}\"]\n",
         assert!(browser.command.contains("--new-window"));
         assert!(browser.command.contains("--new-instance"));
         assert!(browser.command.contains("--user-data-dir="));
-        assert!(browser.command.contains("http://localhost:3001"));
+        assert!(browser.command.contains("http://demo.localhost:48080"));
         assert!(browser
             .env
             .iter()
             .any(|(key, _)| key == "PROJ_BROWSER_PROFILE_DIR"));
-        assert!(browser
-            .env
-            .iter()
-            .any(|(key, value)| key == "PROJ_BROWSER_URL" && value == "http://localhost:3001"));
+        assert!(browser.env.iter().any(|(key, value)| {
+            key == "PROJ_BROWSER_URL" && value == "http://demo.localhost:48080"
+        }));
         assert!(browser.env.iter().any(|(key, _)| key == "XDG_CONFIG_HOME"));
         assert!(browser.env.iter().any(|(key, _)| key == "XDG_CACHE_HOME"));
         assert!(browser.env.iter().any(|(key, _)| key == "XDG_DATA_HOME"));
@@ -3177,7 +3393,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             .iter()
             .find(|spec| spec.name == "browser-1")
             .expect("missing browser spawn spec");
-        assert_eq!(browser.command, "helium http://localhost:3001");
+        assert_eq!(browser.command, "helium http://demo.localhost:48080");
         assert!(!browser.env.iter().any(|(key, _)| key == "XDG_CONFIG_HOME"));
         assert!(!browser.env.iter().any(|(key, _)| key == "XDG_CACHE_HOME"));
         assert!(!browser.env.iter().any(|(key, _)| key == "XDG_DATA_HOME"));
@@ -3338,6 +3554,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             browser_profile_root: base.join("browser-profiles"),
             router_port: DEFAULT_ROUTER_PORT,
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_route_overrides: BTreeMap::new(),
             runtime_processes: BTreeMap::new(),
         };
         state.persist_state().unwrap();
@@ -3380,6 +3597,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             browser_profile_root: base.join("browser-profiles"),
             router_port: DEFAULT_ROUTER_PORT,
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_route_overrides: BTreeMap::new(),
             runtime_processes: BTreeMap::new(),
         };
 
@@ -3519,6 +3737,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             browser_profile_root: base.join("browser-profiles"),
             router_port: DEFAULT_ROUTER_PORT,
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_route_overrides: BTreeMap::new(),
             runtime_processes,
         };
 
@@ -3611,6 +3830,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             browser_profile_root: base.join("browser-profiles"),
             router_port: DEFAULT_ROUTER_PORT,
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_route_overrides: BTreeMap::new(),
             runtime_processes,
         };
 
