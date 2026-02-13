@@ -8,9 +8,9 @@ use projd_types::{
     METHOD_SWITCH, METHOD_UP, NIRI_INTEGRATION_END, NIRI_INTEGRATION_START,
 };
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -282,7 +282,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn resolve_autostart(autostart: bool, no_autostart: bool) -> bool {
+const fn resolve_autostart(autostart: bool, no_autostart: bool) -> bool {
     autostart && !no_autostart
 }
 
@@ -619,23 +619,21 @@ fn format_status_output(result: &StatusResult, json_output: bool) -> Result<Stri
 
     let mut output = String::new();
     for status in &result.projects {
-        output.push_str(
-            format!(
-                "{}\tstate={}\tfocused={}\tworkspace={}\tport={}\tpath={}\n",
-                status.project.name,
-                lifecycle_state_label(&status.state),
-                status.focused,
-                status.project.workspace,
-                status.project.port,
-                status.project.path
-            )
-            .as_str(),
+        let _ = writeln!(
+            output,
+            "{}\tstate={}\tfocused={}\tworkspace={}\tport={}\tpath={}",
+            status.project.name,
+            lifecycle_state_label(&status.state),
+            status.focused,
+            status.project.workspace,
+            status.project.port,
+            status.project.path
         );
     }
     Ok(output)
 }
 
-fn lifecycle_state_label(state: &ProjectLifecycleState) -> &'static str {
+const fn lifecycle_state_label(state: &ProjectLifecycleState) -> &'static str {
     match state {
         ProjectLifecycleState::Active => "active",
         ProjectLifecycleState::Backgrounded => "backgrounded",
@@ -1089,12 +1087,12 @@ fn detect_local_projd_binary() -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn projd_binary_name() -> &'static str {
+const fn projd_binary_name() -> &'static str {
     "projd"
 }
 
 #[cfg(windows)]
-fn projd_binary_name() -> &'static str {
+const fn projd_binary_name() -> &'static str {
     "projd.exe"
 }
 
