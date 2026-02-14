@@ -15,6 +15,12 @@ pub const METHOD_RESUME: &str = "resume";
 pub const METHOD_PEEK: &str = "peek";
 pub const METHOD_STATUS: &str = "status";
 pub const METHOD_LOGS: &str = "logs";
+pub const METHOD_READ_CONFIG: &str = "read_config";
+pub const METHOD_WRITE_CONFIG: &str = "write_config";
+pub const METHOD_INIT_CONFIG: &str = "init_config";
+pub const METHOD_REGISTER: &str = "register";
+pub const METHOD_UNREGISTER: &str = "unregister";
+pub const METHOD_BROWSE: &str = "browse";
 
 pub const NIRI_MANAGED_START: &str = "// === PROJD MANAGED START (do not edit) ===";
 pub const NIRI_MANAGED_END: &str = "// === PROJD MANAGED END ===";
@@ -122,6 +128,7 @@ pub enum ProjectLifecycleState {
     Active,
     Backgrounded,
     Suspended,
+    Stopped,
 }
 
 impl ProjectLifecycleState {
@@ -131,6 +138,7 @@ impl ProjectLifecycleState {
             Self::Active => "active",
             Self::Backgrounded => "backgrounded",
             Self::Suspended => "suspended",
+            Self::Stopped => "stopped",
         }
     }
 }
@@ -176,12 +184,81 @@ pub struct LogsResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadConfigParams {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadConfigResult {
+    pub name: String,
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteConfigParams {
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteConfigResult {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitConfigParams {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitConfigResult {
+    pub path: String,
+    pub content: String,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterParams {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterResult {
+    pub project: ProjectRecord,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowseParams {
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowseEntry {
+    pub name: String,
+    pub path: String,
+    pub has_project_toml: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowseResult {
+    pub path: String,
+    pub parent: Option<String>,
+    pub entries: Vec<BrowseEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {
     pub projects: Vec<ProjectRecord>,
     #[serde(default)]
     pub focused_project: Option<String>,
     #[serde(default)]
     pub suspended_projects: Vec<String>,
+    #[serde(default)]
+    pub stopped_projects: Vec<String>,
 }
 
 #[must_use]
