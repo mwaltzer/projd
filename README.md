@@ -97,7 +97,8 @@ projd fixes all of this. Each project gets:
 
 ## How it works
 
-<img width="2684" height="1542" alt="image" src="https://github.com/user-attachments/assets/79fad34b-0968-487a-b5f7-b1969670442a" />
+<img width="2740" height="1480" alt="image" src="https://github.com/user-attachments/assets/5172c7b4-fe92-4aab-af91-e0d520b689a2" />
+
 
 **Components:**
 
