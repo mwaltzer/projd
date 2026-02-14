@@ -641,16 +641,6 @@ header {
   vertical-align: middle;
 }
 
-/* Focused project badge */
-.badge-focused {
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: 9999px;
-  background: rgba(63, 185, 80, 0.15);
-  color: var(--green);
-  font-weight: 500;
-  margin-left: 4px;
-}
 
 /* Welcome / onboarding empty state */
 .welcome-state {

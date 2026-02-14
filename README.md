@@ -18,7 +18,7 @@ proj status      # see what's running
 Requires Rust toolchain and [mise](https://mise.jdx.dev).
 
 ```bash
-git clone https://github.com/anthropics/projd.git
+git clone https://github.com/mwaltzer/projd.git
 cd projd
 mise run bootstrap
 ```

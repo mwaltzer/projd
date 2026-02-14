@@ -404,9 +404,6 @@
       h("h3", { title: name }, [name]),
       h("span", { class: "badge " + badgeClass(s) }, [s]),
     ];
-    if (proj.focused) {
-      headerChildren.push(h("span", { class: "badge-focused" }, ["focused"]));
-    }
     var header = h("div", { class: "card-header" }, headerChildren);
 
     var meta = h("div", { class: "card-meta" });
