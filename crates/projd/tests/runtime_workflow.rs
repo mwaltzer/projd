@@ -219,10 +219,12 @@ fn runtime_workflow_collects_logs_and_stops_processes() {
     wait_for_log_contains(&server_log, "server-stop");
     wait_for_log_contains(&agent_log, "agent-stop");
 
+    // After down, project is stopped but still registered
     let list_response = request(&harness.socket_path, METHOD_LIST, Value::Null).unwrap();
     assert!(list_response.ok);
     let listed: ListResult = serde_json::from_value(list_response.result.unwrap()).unwrap();
-    assert!(listed.projects.is_empty());
+    assert_eq!(listed.projects.len(), 1);
+    assert_eq!(listed.projects[0].name, "runtime-demo");
 }
 
 #[test]

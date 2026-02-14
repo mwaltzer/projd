@@ -1,8 +1,8 @@
 use projd_types::{
     DownParams, FocusResult, ListResult, NameParams, ProjectLifecycleState, Request, Response,
     StatusParams, StatusResult, UpParams, UpResult, METHOD_DOWN, METHOD_FOCUS, METHOD_LIST,
-    METHOD_PEEK, METHOD_PING, METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND, METHOD_UP,
-    NIRI_MANAGED_END, NIRI_MANAGED_START,
+    METHOD_PEEK, METHOD_PING, METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND, METHOD_UNREGISTER,
+    METHOD_UP, NIRI_MANAGED_END, NIRI_MANAGED_START,
 };
 use serde_json::Value;
 use std::fs;
@@ -252,18 +252,63 @@ fn niri_workflow_up_down_round_trip_updates_managed_section() {
     .expect("down request failed");
     assert!(down_response.ok, "down failed: {:?}", down_response.error);
 
+    // After down, project is stopped but still registered — niri config skips stopped projects
     let niri_after_down =
         fs::read_to_string(&harness.niri_config_path).expect("failed to read niri config");
     assert!(niri_after_down.contains("workspace \"personal\""));
     assert!(niri_after_down.contains(NIRI_MANAGED_START));
     assert!(niri_after_down.contains(NIRI_MANAGED_END));
+    assert!(!niri_after_down.contains("workspace \"frontend\""));
     assert!(!niri_after_down.contains(r#"match title="^\\[proj:frontend\\]$""#));
-    assert!(!niri_after_down.contains("open-on-workspace \"frontend\""));
+
+    let status_after_down = request(
+        &harness.socket_path,
+        METHOD_STATUS,
+        serde_json::to_value(StatusParams { name: None }).expect("failed to serialize status"),
+    )
+    .expect("status request failed");
+    assert!(status_after_down.ok);
+    let status_result_down: StatusResult =
+        serde_json::from_value(status_after_down.result.expect("missing status result")).unwrap();
+    assert_eq!(status_result_down.projects.len(), 1);
+    assert_eq!(
+        status_result_down.projects[0].state,
+        ProjectLifecycleState::Stopped
+    );
 
     let list_response = request(&harness.socket_path, METHOD_LIST, Value::Null).unwrap();
     assert!(list_response.ok);
     let listed: ListResult = serde_json::from_value(list_response.result.unwrap()).unwrap();
-    assert!(listed.projects.is_empty());
+    assert_eq!(listed.projects.len(), 1);
+
+    // Unregister fully removes the project
+    let unregister_response = request(
+        &harness.socket_path,
+        METHOD_UNREGISTER,
+        serde_json::to_value(DownParams {
+            name: "frontend".to_string(),
+        })
+        .expect("failed to serialize unregister params"),
+    )
+    .expect("unregister request failed");
+    assert!(
+        unregister_response.ok,
+        "unregister failed: {:?}",
+        unregister_response.error
+    );
+
+    let niri_after_unregister =
+        fs::read_to_string(&harness.niri_config_path).expect("failed to read niri config");
+    assert!(niri_after_unregister.contains("workspace \"personal\""));
+    assert!(!niri_after_unregister.contains(r#"match title="^\\[proj:frontend\\]$""#));
+    assert!(!niri_after_unregister.contains("open-on-workspace \"frontend\""));
+
+    let list_after_unregister =
+        request(&harness.socket_path, METHOD_LIST, Value::Null).unwrap();
+    assert!(list_after_unregister.ok);
+    let listed_after: ListResult =
+        serde_json::from_value(list_after_unregister.result.unwrap()).unwrap();
+    assert!(listed_after.projects.is_empty());
 }
 
 #[test]
