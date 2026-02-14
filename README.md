@@ -4,37 +4,36 @@
 
 `projd` is a daemon + CLI that turns each project directory into a self-contained runtime environment: dedicated workspace, dev server with automatic port allocation, browser with isolated profile, editor, background agents, and a local `.localhost` router -- all from a single TOML file.
 
-```bash
-cd ~/Code/my-app
-proj up          # start everything: server, browser, editor, workspace
-proj focus api   # jump to another project's workspace instantly
-proj status      # see what's running
-```
-
-![Web dashboard](docs/screenshots/web-dashboard.png)
-
 ## Install
 
 ```bash
 cargo install --git https://github.com/mwaltzer/projd.git proj projd proj-tui
 ```
 
-Optionally, install Niri workspace integration:
-
-```bash
-proj install niri
-```
-
 ## Quick start
 
 ```bash
 cd ~/Code/my-app
-proj up                # registers project, allocates port, starts everything
+proj up
 ```
 
-That's it. The daemon starts automatically. On Niri, it assigns a workspace and focuses it.
+That's it. The daemon starts automatically, registers the project, allocates a port, and on Niri assigns a workspace.
 
-To add a dev server and browser, create `.project.toml` in the project root:
+Open `http://localhost:48080` to manage everything from the browser:
+
+![Web dashboard](docs/screenshots/web-dashboard.png)
+
+Or use the CLI:
+
+```bash
+proj focus api         # jump to another project's workspace
+proj list              # see all registered projects
+proj status            # see what's running
+```
+
+### Add a dev server and browser
+
+Create `.project.toml` in the project root:
 
 ```toml
 [server]
@@ -45,15 +44,25 @@ port_env = "PORT"
 urls = ["${PROJ_ORIGIN}"]
 ```
 
-Then `proj up` again. The daemon allocates a port, injects it as `$PORT`, starts your server, and opens `http://my-app.localhost:48080` in an isolated browser.
+Run `proj up` again. The daemon allocates a port, injects it as `$PORT`, starts your server, and opens `http://my-app.localhost:48080` in an isolated browser.
 
-Switch between projects:
+### Niri workspace integration
 
 ```bash
-proj focus api         # jump to another project's workspace
-proj list              # see all registered projects
-proj status            # see what's running
+proj install niri
 ```
+
+This adds managed keybindings and a status bar helper to your Niri config.
+
+## Web UI
+
+The daemon serves a live dashboard at `http://localhost:48080` with real-time updates via SSE.
+
+Start/stop/focus projects, browse directories to add new ones, edit `.project.toml` in-place, and view logs.
+
+![Project config editor](docs/screenshots/web-config.png)
+
+![Add project wizard](docs/screenshots/web-add-project.png)
 
 ## What problem does projd solve?
 
@@ -184,16 +193,6 @@ proj-tui                                     Interactive terminal dashboard
 2. Directories in `$PROJ_PROJECT_ROOTS` (colon-separated)
 3. `~/Code/<name>`
 
-## Web UI
-
-The daemon serves a dashboard at `http://localhost:48080` with real-time status updates via SSE.
-
-![Project config editor](docs/screenshots/web-config.png)
-
-Features: start/stop/focus/suspend projects, browse and add project directories, edit `.project.toml` in-place, view logs, and filter by state.
-
-![Add project wizard](docs/screenshots/web-add-project.png)
-
 ## Status bar integration
 
 For Waybar, Quickshell, or custom dashboards:
@@ -211,8 +210,6 @@ Output shape:
 ```json
 {"projects":[{"project":{"name":"frontend","path":"/home/me/Code/frontend","workspace":"frontend","port":3001},"state":"active","focused":true}]}
 ```
-
-`proj install niri` also installs a `status-watch.sh` helper for this.
 
 ## Niri integration
 
