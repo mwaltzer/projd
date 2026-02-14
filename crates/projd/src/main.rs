@@ -1,12 +1,15 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use projd_types::{
-    default_niri_config_path, default_socket_path, default_state_path, DownParams, FocusResult,
-    ListResult, LogsParams, LogsResult, NameParams, PersistedState, ProcessLogs,
-    ProjectLifecycleState, ProjectRecord, ProjectStatus, Request, Response, StatusParams,
-    StatusResult, UpParams, UpResult, METHOD_DOWN, METHOD_FOCUS, METHOD_LIST, METHOD_LOGS,
-    METHOD_PEEK, METHOD_PING, METHOD_RESUME, METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND,
-    METHOD_SWITCH, METHOD_UP, NIRI_MANAGED_END, NIRI_MANAGED_START,
+    default_niri_config_path, default_socket_path, default_state_path, BrowseEntry, BrowseParams,
+    BrowseResult, DownParams, FocusResult, InitConfigParams, InitConfigResult, ListResult,
+    LogsParams, LogsResult, NameParams, PersistedState, ProcessLogs, ProjectLifecycleState,
+    ProjectRecord, ProjectStatus, ReadConfigParams, ReadConfigResult, RegisterParams,
+    RegisterResult, Request, Response, StatusParams, StatusResult, UpParams, UpResult,
+    WriteConfigParams, WriteConfigResult, METHOD_BROWSE, METHOD_DOWN, METHOD_FOCUS,
+    METHOD_INIT_CONFIG, METHOD_LIST, METHOD_LOGS, METHOD_PEEK, METHOD_PING, METHOD_READ_CONFIG,
+    METHOD_REGISTER, METHOD_RESUME, METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND, METHOD_SWITCH,
+    METHOD_UNREGISTER, METHOD_UP, METHOD_WRITE_CONFIG, NIRI_MANAGED_END, NIRI_MANAGED_START,
 };
 use regex::Regex;
 use serde::de::DeserializeOwned;
@@ -31,6 +34,11 @@ const ROUTER_HEADER_LIMIT_BYTES: usize = 64 * 1024;
 const ROUTER_MAX_CONCURRENT_STREAMS: usize = 256;
 const ROUTER_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMON_HARDCODED_PORTS: &[u16] = &[3000, 4173, 4200, 4321, 5000, 5173, 5174, 8000, 8080];
+
+const WEB_INDEX_HTML: &str = include_str!("../web/index.html");
+const WEB_STYLE_CSS: &str = include_str!("../web/style.css");
+const WEB_APP_JS: &str = include_str!("../web/app.js");
+const WEB_API_MAX_BODY: usize = 256 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "projd", version, about = "Project daemon for proj CLI")]
@@ -69,6 +77,9 @@ fn main() -> Result<()> {
         router_routes.clone(),
     )?;
     app_state.sync_router_routes()?;
+    if let Err(err) = app_state.write_niri_config() {
+        warn!("failed to write niri config on startup: {err}");
+    }
 
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)
@@ -91,8 +102,15 @@ fn main() -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     install_signal_handler(running.clone());
     let router_running = running.clone();
+    let router_socket_path = socket_path.clone();
     let router_handle = thread::spawn(move || {
-        run_host_router(router_listener, router_routes, router_running, router_port)
+        run_host_router(
+            router_listener,
+            router_routes,
+            router_running,
+            router_port,
+            router_socket_path,
+        )
     });
 
     while running.load(Ordering::SeqCst) {
@@ -277,9 +295,11 @@ fn run_host_router(
     routes: Arc<Mutex<BTreeMap<String, u16>>>,
     running: Arc<AtomicBool>,
     router_port: u16,
+    socket_path: PathBuf,
 ) {
     info!("projd host router listening on 127.0.0.1:{router_port}");
     let active_streams = Arc::new(AtomicUsize::new(0));
+    let socket_path = Arc::new(socket_path);
     while running.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -295,9 +315,10 @@ fn run_host_router(
                 }
                 let routes = routes.clone();
                 let active_streams = active_streams.clone();
+                let socket_path = socket_path.clone();
                 thread::spawn(move || {
                     let _guard = RouterStreamGuard::new(active_streams);
-                    if let Err(err) = handle_host_router_stream(stream, routes) {
+                    if let Err(err) = handle_host_router_stream(stream, routes, &socket_path) {
                         warn!("host router stream failed: {err:#}");
                     }
                 });
@@ -332,6 +353,7 @@ impl Drop for RouterStreamGuard {
 fn handle_host_router_stream(
     mut client: TcpStream,
     routes: Arc<Mutex<BTreeMap<String, u16>>>,
+    socket_path: &Path,
 ) -> Result<()> {
     client
         .set_read_timeout(Some(ROUTER_HEADER_TIMEOUT))
@@ -359,6 +381,9 @@ fn handle_host_router_stream(
         return Ok(());
     };
     let Some(route_key) = localhost_route_key_from_host(&host) else {
+        if is_bare_localhost(&host) {
+            return handle_web_ui_request(&mut client, &initial, socket_path);
+        }
         write_http_error(&mut client, "404 Not Found", "unknown project host route")?;
         return Ok(());
     };
@@ -484,6 +509,186 @@ fn localhost_route_key_from_host(host: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn is_bare_localhost(host: &str) -> bool {
+    let without_port = host
+        .split_once(':')
+        .map(|(left, _)| left)
+        .unwrap_or(host)
+        .trim()
+        .to_ascii_lowercase();
+    without_port == "localhost" || without_port == "127.0.0.1"
+}
+
+fn extract_request_method_and_path(head: &[u8]) -> Option<(String, String)> {
+    let text = std::str::from_utf8(head).ok()?;
+    let request_line = text.lines().next()?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    Some((method.to_string(), path.to_string()))
+}
+
+fn extract_content_length(head: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(head).ok()?;
+    for line in text.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            return value.trim().parse::<usize>().ok();
+        }
+    }
+    None
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .context("failed to write HTTP response header")?;
+    stream
+        .write_all(body)
+        .context("failed to write HTTP response body")
+}
+
+fn handle_web_ui_request(
+    client: &mut TcpStream,
+    head: &[u8],
+    socket_path: &Path,
+) -> Result<()> {
+    let Some((method, path)) = extract_request_method_and_path(head) else {
+        write_http_error(client, "400 Bad Request", "malformed request line")?;
+        return Ok(());
+    };
+    match (method.as_str(), path.as_str()) {
+        ("GET", "/") => write_http_response(client, "200 OK", "text/html; charset=utf-8", WEB_INDEX_HTML.as_bytes()),
+        ("GET", "/style.css") => write_http_response(client, "200 OK", "text/css; charset=utf-8", WEB_STYLE_CSS.as_bytes()),
+        ("GET", "/app.js") => write_http_response(client, "200 OK", "application/javascript; charset=utf-8", WEB_APP_JS.as_bytes()),
+        ("POST", "/api") => handle_web_api_request(client, head, socket_path),
+        _ => write_http_error(client, "404 Not Found", "not found"),
+    }
+}
+
+fn handle_web_api_request(
+    client: &mut TcpStream,
+    head: &[u8],
+    socket_path: &Path,
+) -> Result<()> {
+    let content_length = extract_content_length(head).unwrap_or(0);
+    if content_length > WEB_API_MAX_BODY {
+        write_http_error(client, "413 Payload Too Large", "request body too large")?;
+        return Ok(());
+    }
+
+    // The head buffer may contain some or all of the body after \r\n\r\n
+    let head_str = std::str::from_utf8(head).unwrap_or("");
+    let body_start = head_str
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(head.len());
+    let mut body = head[body_start..].to_vec();
+
+    // Read remaining body bytes
+    if body.len() < content_length {
+        let remaining = content_length - body.len();
+        let mut buf = vec![0u8; remaining];
+        client
+            .read_exact(&mut buf)
+            .context("failed to read API request body")?;
+        body.extend_from_slice(&buf);
+    }
+
+    let api_request: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            let error_body = serde_json::to_vec(&json!({
+                "id": 0, "ok": false, "error": format!("invalid JSON: {err}")
+            }))
+            .unwrap_or_default();
+            write_http_response(client, "400 Bad Request", "application/json", &error_body)?;
+            return Ok(());
+        }
+    };
+
+    let method = api_request
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if method == METHOD_SHUTDOWN {
+        let error_body = serde_json::to_vec(&json!({
+            "id": api_request.get("id").and_then(|v| v.as_u64()).unwrap_or(0),
+            "ok": false,
+            "error": "shutdown is not allowed from the web UI"
+        }))
+        .unwrap_or_default();
+        write_http_response(client, "403 Forbidden", "application/json", &error_body)?;
+        return Ok(());
+    }
+
+    let rpc_request = Request {
+        id: api_request
+            .get("id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        method: method.to_string(),
+        params: api_request
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    };
+
+    match relay_rpc_to_socket(socket_path, &rpc_request) {
+        Ok(response_bytes) => {
+            write_http_response(client, "200 OK", "application/json", &response_bytes)?;
+        }
+        Err(err) => {
+            let error_body = serde_json::to_vec(&json!({
+                "id": rpc_request.id, "ok": false, "error": format!("daemon relay failed: {err}")
+            }))
+            .unwrap_or_default();
+            write_http_response(
+                client,
+                "502 Bad Gateway",
+                "application/json",
+                &error_body,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn relay_rpc_to_socket(socket_path: &Path, request: &Request) -> Result<Vec<u8>> {
+    let stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("failed to connect to daemon socket: {}", socket_path.display()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .context("failed to set relay read timeout")?;
+    let mut writer = BufWriter::new(
+        stream
+            .try_clone()
+            .context("failed to clone relay stream")?,
+    );
+    let mut reader = BufReader::new(stream);
+    serde_json::to_writer(&mut writer, request).context("failed to write relay request")?;
+    writer
+        .write_all(b"\n")
+        .context("failed to write relay newline")?;
+    writer.flush().context("failed to flush relay request")?;
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .context("failed to read relay response")?;
+    Ok(line.trim_end().as_bytes().to_vec())
 }
 
 fn handle_request(request: &Request, app_state: &mut AppState) -> (Response, bool) {
@@ -627,11 +832,129 @@ fn handle_request(request: &Request, app_state: &mut AppState) -> (Response, boo
             ),
             Err(err) => (Response::err(request.id, err.to_string()), false),
         },
+        METHOD_READ_CONFIG => match parse_params::<ReadConfigParams>(&request.params)
+            .and_then(|params| app_state.read_config(&params.name))
+        {
+            Ok(result) => (
+                Response::ok(
+                    request.id,
+                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+                ),
+                false,
+            ),
+            Err(err) => (Response::err(request.id, err.to_string()), false),
+        },
+        METHOD_WRITE_CONFIG => match parse_params::<WriteConfigParams>(&request.params)
+            .and_then(|params| app_state.write_config(&params.name, &params.content))
+        {
+            Ok(result) => (
+                Response::ok(
+                    request.id,
+                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+                ),
+                false,
+            ),
+            Err(err) => (Response::err(request.id, err.to_string()), false),
+        },
+        METHOD_INIT_CONFIG => match parse_params::<InitConfigParams>(&request.params)
+            .and_then(|params| init_config(&params.path))
+        {
+            Ok(result) => (
+                Response::ok(
+                    request.id,
+                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+                ),
+                false,
+            ),
+            Err(err) => (Response::err(request.id, err.to_string()), false),
+        },
+        METHOD_REGISTER => match parse_params::<RegisterParams>(&request.params)
+            .and_then(|params| app_state.register(params))
+        {
+            Ok(result) => (
+                Response::ok(
+                    request.id,
+                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+                ),
+                false,
+            ),
+            Err(err) => (Response::err(request.id, err.to_string()), false),
+        },
+        METHOD_UNREGISTER => match parse_params::<DownParams>(&request.params)
+            .and_then(|params| app_state.unregister(params))
+        {
+            Ok(result) => (
+                Response::ok(
+                    request.id,
+                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+                ),
+                false,
+            ),
+            Err(err) => (Response::err(request.id, err.to_string()), false),
+        },
+        METHOD_BROWSE => match (if request.params.is_null() {
+            Ok(BrowseParams { path: None })
+        } else {
+            parse_params::<BrowseParams>(&request.params)
+        })
+        .and_then(|params| browse_directory(params))
+        {
+            Ok(result) => (
+                Response::ok(
+                    request.id,
+                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+                ),
+                false,
+            ),
+            Err(err) => (Response::err(request.id, err.to_string()), false),
+        },
         method => (
             Response::err(request.id, format!("unknown method: {method}")),
             false,
         ),
     }
+}
+
+fn browse_directory(params: BrowseParams) -> Result<BrowseResult> {
+    let raw_path = params.path.unwrap_or_else(|| "~/Code".to_string());
+    let expanded = expand_tilde(&raw_path);
+    let dir = fs::canonicalize(&expanded)
+        .with_context(|| format!("failed to resolve path: {raw_path}"))?;
+    if !dir.is_dir() {
+        bail!("not a directory: {}", dir.display());
+    }
+
+    let parent = dir.parent().map(|p| path_to_string(p));
+    let mut entries = Vec::new();
+
+    let mut read_entries: Vec<_> = fs::read_dir(&dir)
+        .with_context(|| format!("failed to read directory: {}", dir.display()))?
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                && !e
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with('.'))
+        })
+        .collect();
+    read_entries.sort_by_key(|e| e.file_name());
+
+    for entry in read_entries {
+        let entry_path = entry.path();
+        let has_project_toml = entry_path.join(".project.toml").exists();
+        entries.push(BrowseEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            path: path_to_string(&entry_path),
+            has_project_toml,
+        });
+    }
+
+    Ok(BrowseResult {
+        path: path_to_string(&dir),
+        parent,
+        entries,
+    })
 }
 
 fn parse_params<T: DeserializeOwned>(params: &serde_json::Value) -> Result<T> {
@@ -643,6 +966,7 @@ struct AppState {
     projects: BTreeMap<String, ProjectRecord>,
     focused_project: Option<String>,
     suspended_projects: HashSet<String>,
+    stopped_projects: HashSet<String>,
     state_path: PathBuf,
     niri_config_path: PathBuf,
     logs_path: PathBuf,
@@ -731,6 +1055,7 @@ impl AppState {
         let mut projects = BTreeMap::new();
         let mut focused_project: Option<String> = None;
         let mut suspended_projects = HashSet::new();
+        let mut stopped_projects = HashSet::new();
         let logs_path = state_path
             .parent()
             .map(|path| path.join("logs"))
@@ -767,19 +1092,24 @@ impl AppState {
                         suspended_projects.insert(name);
                     }
                 }
+                for name in persisted.stopped_projects {
+                    if projects.contains_key(&name) {
+                        stopped_projects.insert(name);
+                    }
+                }
             }
         }
 
         if focused_project
             .as_ref()
-            .is_some_and(|name| suspended_projects.contains(name))
+            .is_some_and(|name| suspended_projects.contains(name) || stopped_projects.contains(name))
         {
             focused_project = None;
         }
         if focused_project.is_none() {
             focused_project = projects
                 .keys()
-                .find(|name| !suspended_projects.contains(*name))
+                .find(|name| !suspended_projects.contains(*name) && !stopped_projects.contains(*name))
                 .cloned();
         }
 
@@ -787,6 +1117,7 @@ impl AppState {
             projects,
             focused_project,
             suspended_projects,
+            stopped_projects,
             state_path,
             niri_config_path,
             logs_path,
@@ -813,7 +1144,8 @@ impl AppState {
             .as_deref()
             .map(|workspace| validate_workspace_name(workspace, "up.workspace"))
             .transpose()?;
-        let project_dir = fs::canonicalize(&params.path)
+        let expanded_path = expand_tilde(&params.path);
+        let project_dir = fs::canonicalize(&expanded_path)
             .with_context(|| format!("failed to resolve project path: {}", params.path))?;
         if !project_dir.is_dir() {
             bail!("project path is not a directory: {}", project_dir.display());
@@ -851,11 +1183,19 @@ impl AppState {
 
         if let Some(existing) = self.projects.get(&project_name) {
             if existing.path == project_path {
+                let was_stopped = self.stopped_projects.remove(&project_name);
                 let mut existing = existing.clone();
-                if existing.workspace != desired_workspace {
-                    let previous_projects = self.projects.clone();
+                if existing.port == 0 {
+                    existing.port = self.allocate_port()?;
+                    self.projects.insert(project_name.clone(), existing.clone());
+                }
+                let workspace_changed = existing.workspace != desired_workspace;
+                if workspace_changed {
                     existing.workspace = desired_workspace;
                     self.projects.insert(project_name.clone(), existing.clone());
+                }
+                if workspace_changed || was_stopped {
+                    let previous_projects = self.projects.clone();
                     if let Err(err) = self.sync() {
                         self.projects = previous_projects;
                         return Err(err);
@@ -943,26 +1283,126 @@ impl AppState {
         }
         self.stop_runtime_for_project(&params.name)?;
 
+        let project = self.projects.get(&params.name).expect("checked presence above").clone();
+        let previous_focus = self.focused_project.clone();
+        let previous_suspended = self.suspended_projects.clone();
+        let previous_stopped = self.stopped_projects.clone();
+        self.runtime_route_overrides.remove(&params.name);
+        self.suspended_projects.remove(&params.name);
+        self.stopped_projects.insert(params.name.clone());
+        if self.focused_project.as_deref() == Some(params.name.as_str()) {
+            self.focused_project = self
+                .projects
+                .keys()
+                .find(|name| !self.suspended_projects.contains(*name) && !self.stopped_projects.contains(*name))
+                .cloned();
+        }
+        if let Err(err) = self.sync() {
+            self.focused_project = previous_focus;
+            self.suspended_projects = previous_suspended;
+            self.stopped_projects = previous_stopped;
+            return Err(err);
+        }
+
+        Ok(project)
+    }
+
+    fn register(&mut self, params: RegisterParams) -> Result<RegisterResult> {
+        let expanded_path = expand_tilde(&params.path);
+        let project_dir = fs::canonicalize(&expanded_path)
+            .with_context(|| format!("failed to resolve project path: {}", params.path))?;
+        if !project_dir.is_dir() {
+            bail!("project path is not a directory: {}", project_dir.display());
+        }
+
+        let project_cfg = load_project_config(&project_dir)?;
+        let project_name = project_cfg.name.clone();
+        let project_path = path_to_string(&project_cfg.path);
+
+        if let Some(existing) = self.projects.get(&project_name) {
+            if existing.path == project_path {
+                return Ok(RegisterResult {
+                    project: existing.clone(),
+                    created: false,
+                });
+            }
+            bail!(
+                "project '{}' is already registered with path {}",
+                project_name,
+                existing.path
+            );
+        }
+
+        if let Some(conflict) = self
+            .projects
+            .values()
+            .find(|project| project.path == project_path)
+        {
+            bail!(
+                "path '{}' is already registered by project '{}'",
+                project_path,
+                conflict.name
+            );
+        }
+
+        let workspace = resolved_project_workspace(
+            &project_name,
+            project_cfg.workspace.as_deref(),
+            None,
+        )?;
+
+        let project = ProjectRecord {
+            name: project_name.clone(),
+            path: project_path,
+            workspace,
+            port: 0,
+        };
+
+        let previous = self.projects.clone();
+        let previous_stopped = self.stopped_projects.clone();
+        self.projects.insert(project.name.clone(), project.clone());
+        self.stopped_projects.insert(project_name.clone());
+        if let Err(err) = self.persist_state() {
+            self.projects = previous;
+            self.stopped_projects = previous_stopped;
+            return Err(err);
+        }
+
+        Ok(RegisterResult {
+            project,
+            created: true,
+        })
+    }
+
+    fn unregister(&mut self, params: DownParams) -> Result<ProjectRecord> {
+        if !self.projects.contains_key(&params.name) {
+            bail!("project '{}' is not registered", params.name);
+        }
+        self.stop_runtime_for_project(&params.name)?;
+
         let previous = self.projects.clone();
         let previous_focus = self.focused_project.clone();
         let previous_suspended = self.suspended_projects.clone();
+        let previous_stopped = self.stopped_projects.clone();
         let removed = self
             .projects
             .remove(&params.name)
             .expect("checked presence above");
         self.runtime_route_overrides.remove(&params.name);
         self.suspended_projects.remove(&params.name);
+        self.stopped_projects.remove(&params.name);
         if self.focused_project.as_deref() == Some(params.name.as_str()) {
             self.focused_project = self
                 .projects
                 .keys()
-                .find(|name| !self.suspended_projects.contains(*name))
+                .find(|name| !self.suspended_projects.contains(*name) && !self.stopped_projects.contains(*name))
                 .cloned();
         }
         if let Err(err) = self.sync() {
             self.projects = previous;
             self.focused_project = previous_focus;
             self.suspended_projects = previous_suspended;
+            self.stopped_projects = previous_stopped;
             return Err(err);
         }
 
@@ -985,7 +1425,7 @@ impl AppState {
         }
 
         let previous_focus = self.focused_project.clone();
-        focus_workspace_in_niri(&project.workspace)?;
+        focus_project_workspace_in_niri(&project)?;
         self.focused_project = Some(name.to_string());
         if let Err(err) = self.persist_state() {
             self.focused_project = previous_focus;
@@ -1005,7 +1445,7 @@ impl AppState {
         let mut windows_surfaced = false;
 
         let previous_focus = self.focused_project.clone();
-        match focus_workspace_in_niri(&project.workspace) {
+        match focus_project_workspace_in_niri(&project) {
             Ok(()) => {
                 workspace_focused = true;
                 self.focused_project = Some(project.name.clone());
@@ -1020,7 +1460,7 @@ impl AppState {
             )),
         }
 
-        match surface_window_in_niri(&project.workspace) {
+        match surface_window_in_niri(niri_workspace_name(&project)) {
             Ok(surface_result) => {
                 windows_surfaced = surface_result;
                 if !surface_result {
@@ -1075,7 +1515,7 @@ impl AppState {
 
         let previous_focus = self.focused_project.clone();
         let previous_suspended = self.suspended_projects.clone();
-        focus_workspace_in_niri(&project.workspace)?;
+        focus_project_workspace_in_niri(&project)?;
         self.suspended_projects.remove(name);
         self.focused_project = Some(name.to_string());
         if let Err(err) = self.persist_state() {
@@ -1167,6 +1607,39 @@ impl AppState {
         })
     }
 
+    fn read_config(&self, name: &str) -> Result<ReadConfigResult> {
+        let project = self.project_by_name(name)?;
+        let config_path = Path::new(&project.path).join(".project.toml");
+        if !config_path.exists() {
+            bail!(
+                "no .project.toml found for project '{}' at {}",
+                name,
+                config_path.display()
+            );
+        }
+        let content = fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        Ok(ReadConfigResult {
+            name: name.to_string(),
+            path: path_to_string(&config_path),
+            content,
+        })
+    }
+
+    fn write_config(&self, name: &str, content: &str) -> Result<WriteConfigResult> {
+        let project = self.project_by_name(name)?;
+        let config_path = Path::new(&project.path).join(".project.toml");
+        // Validate TOML before writing
+        content
+            .parse::<toml::Value>()
+            .context("invalid TOML content")?;
+        atomic_write_file(&config_path, content.as_bytes())?;
+        Ok(WriteConfigResult {
+            name: name.to_string(),
+            path: path_to_string(&config_path),
+        })
+    }
+
     fn shutdown(&mut self) -> Result<()> {
         let names: Vec<String> = self.runtime_processes.keys().cloned().collect();
         let mut failures = Vec::new();
@@ -1198,7 +1671,7 @@ impl AppState {
                         let workspace_name = self
                             .projects
                             .get(&project_name)
-                            .map(|project| project.workspace.clone())
+                            .map(|project| niri_workspace_name(project).to_string())
                             .unwrap_or_else(|| project_name.clone());
                         let context = RuntimeExitNotification {
                             project_name: project_name.clone(),
@@ -1259,9 +1732,12 @@ impl AppState {
     }
 
     fn project_status(&self, project: &ProjectRecord) -> ProjectStatus {
+        let stopped = self.stopped_projects.contains(project.name.as_str());
         let suspended = self.suspended_projects.contains(project.name.as_str());
-        let focused = !suspended && self.focused_project.as_deref() == Some(project.name.as_str());
-        let state = if suspended {
+        let focused = !suspended && !stopped && self.focused_project.as_deref() == Some(project.name.as_str());
+        let state = if stopped {
+            ProjectLifecycleState::Stopped
+        } else if suspended {
             ProjectLifecycleState::Suspended
         } else if focused {
             ProjectLifecycleState::Active
@@ -1541,7 +2017,7 @@ impl AppState {
             warnings.push(format!("failed to reload niri config: {err}"));
         }
 
-        if let Err(err) = focus_workspace_in_niri(&project.workspace) {
+        if let Err(err) = focus_project_workspace_in_niri(project) {
             warnings.push(format!(
                 "failed to focus niri workspace '{}': {err}",
                 project.workspace
@@ -1669,6 +2145,8 @@ impl AppState {
         }
         let mut suspended_projects: Vec<String> = self.suspended_projects.iter().cloned().collect();
         suspended_projects.sort();
+        let mut stopped_projects_vec: Vec<String> = self.stopped_projects.iter().cloned().collect();
+        stopped_projects_vec.sort();
         let state = PersistedState {
             projects: self.projects.values().cloned().collect(),
             focused_project: self
@@ -1676,6 +2154,7 @@ impl AppState {
                 .clone()
                 .filter(|name| self.projects.contains_key(name)),
             suspended_projects,
+            stopped_projects: stopped_projects_vec,
         };
         let data =
             serde_json::to_string_pretty(&state).context("failed to serialize daemon state")?;
@@ -1704,7 +2183,7 @@ impl AppState {
             String::new()
         };
 
-        let managed_fragment = render_niri_fragment(&self.projects);
+        let managed_fragment = render_niri_fragment(&self.projects, &self.stopped_projects);
         let updated = write_managed_section(&current, &managed_fragment)?;
         if updated == current {
             return Ok(());
@@ -1731,25 +2210,89 @@ impl AppState {
 
 #[derive(Debug, Deserialize)]
 struct RawProjectConfig {
-    name: String,
-    path: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
     #[serde(default)]
     workspace: Option<String>,
     #[serde(default)]
     depends_on: Vec<String>,
     #[serde(default)]
-    server: Option<RawServerConfig>,
+    server: Option<RawServerEntry>,
     #[serde(default)]
     agents: Vec<RawNamedCommandConfig>,
     #[serde(default)]
     terminals: Vec<RawTerminalConfig>,
     #[serde(default)]
-    editor: Option<RawEditorConfig>,
+    editor: Option<RawEditorEntry>,
     #[serde(default)]
-    browser: Option<RawBrowserConfig>,
+    browser: Option<RawBrowserEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum RawServerEntry {
+    Short(String),
+    Full(RawServerConfig),
+}
+
+impl RawServerEntry {
+    fn into_full(self) -> RawServerConfig {
+        match self {
+            RawServerEntry::Short(command) => RawServerConfig {
+                command,
+                port_env: None,
+                ready_pattern: None,
+                cwd: None,
+            },
+            RawServerEntry::Full(config) => config,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum RawEditorEntry {
+    Short(String),
+    Full(RawEditorConfig),
+}
+
+impl RawEditorEntry {
+    fn into_full(self) -> RawEditorConfig {
+        match self {
+            RawEditorEntry::Short(command) => RawEditorConfig {
+                command,
+                args: vec![],
+                cwd: None,
+            },
+            RawEditorEntry::Full(config) => config,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum RawBrowserEntry {
+    Enabled(bool),
+    Full(RawBrowserConfig),
+}
+
+impl RawBrowserEntry {
+    fn into_full(self) -> Option<RawBrowserConfig> {
+        match self {
+            RawBrowserEntry::Enabled(false) => None,
+            RawBrowserEntry::Enabled(true) => Some(RawBrowserConfig {
+                command: None,
+                urls: vec!["${PROJ_ORIGIN}".to_string()],
+                isolate_profile: true,
+            }),
+            RawBrowserEntry::Full(config) => Some(config),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct RawServerConfig {
     command: String,
     #[serde(default)]
@@ -1777,7 +2320,7 @@ struct RawTerminalConfig {
     cwd: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RawEditorConfig {
     command: String,
     #[serde(default)]
@@ -1786,7 +2329,7 @@ struct RawEditorConfig {
     cwd: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RawBrowserConfig {
     #[serde(default)]
     command: Option<String>,
@@ -1807,23 +2350,69 @@ fn load_project_config(project_dir: &Path) -> Result<LoadedProjectConfig> {
     let parsed: RawProjectConfig =
         toml::from_str(&raw).context("invalid .project.toml (failed to parse TOML)")?;
 
-    let name = parsed.name.trim().to_string();
-    if name.is_empty() {
-        bail!("project name in .project.toml cannot be empty");
-    }
+    let name = match &parsed.name {
+        Some(n) => {
+            let trimmed = n.trim().to_string();
+            if trimmed.is_empty() {
+                bail!("project name in .project.toml cannot be empty");
+            }
+            trimmed
+        }
+        None => project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "project".to_string()),
+    };
     let workspace = parsed
         .workspace
         .as_deref()
         .map(|value| validate_workspace_name(value, "workspace"))
         .transpose()?;
 
-    let normalized_path = normalize_project_path(&parsed.path, project_dir)?;
+    let raw_path = parsed.path.as_deref().unwrap_or(".");
+    let normalized_path = normalize_project_path(raw_path, project_dir)?;
     let runtime = build_runtime_config(&parsed, &normalized_path)?;
     Ok(LoadedProjectConfig {
         name,
         path: normalized_path,
         workspace,
         runtime,
+    })
+}
+
+fn init_config(path: &str) -> Result<InitConfigResult> {
+    let expanded = expand_tilde(path);
+    let dir = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .context("failed to determine current directory")?
+            .join(expanded)
+    };
+    if !dir.is_dir() {
+        bail!("path is not a directory: {}", dir.display());
+    }
+    let config_path = dir.join(".project.toml");
+    if config_path.exists() {
+        let content = fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        return Ok(InitConfigResult {
+            path: path_to_string(&config_path),
+            content,
+            created: false,
+        });
+    }
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project");
+    let content = format!("name = \"{name}\"\nserver = \"echo 'configure your server command'\"\n");
+    atomic_write_file(&config_path, content.as_bytes())?;
+    Ok(InitConfigResult {
+        path: path_to_string(&config_path),
+        content,
+        created: true,
     })
 }
 
@@ -1837,7 +2426,8 @@ fn build_runtime_config(parsed: &RawProjectConfig, project_path: &Path) -> Resul
         ..RuntimeConfig::default()
     };
 
-    if let Some(server) = &parsed.server {
+    if let Some(entry) = parsed.server.clone() {
+        let server = entry.into_full();
         let command = non_empty_field(&server.command, "server.command")?;
         let port_env = server
             .port_env
@@ -1885,7 +2475,8 @@ fn build_runtime_config(parsed: &RawProjectConfig, project_path: &Path) -> Resul
         });
     }
 
-    if let Some(editor) = &parsed.editor {
+    if let Some(entry) = parsed.editor.clone() {
+        let editor = entry.into_full();
         let command = non_empty_field(&editor.command, "editor.command")?;
         runtime.editor = Some(EditorRuntimeConfig {
             command: build_shell_command_with_args(&command, &editor.args),
@@ -1893,18 +2484,20 @@ fn build_runtime_config(parsed: &RawProjectConfig, project_path: &Path) -> Resul
         });
     }
 
-    if let Some(browser) = &parsed.browser {
-        runtime.browser_command = browser
-            .command
-            .as_deref()
-            .map(|value| non_empty_field(value, "browser.command"))
-            .transpose()?;
-        runtime.browser_urls = browser
-            .urls
-            .iter()
-            .map(|url| non_empty_field(url, "browser.urls[]"))
-            .collect::<Result<Vec<_>>>()?;
-        runtime.browser_isolate_profile = browser.isolate_profile;
+    if let Some(entry) = parsed.browser.clone() {
+        if let Some(browser) = entry.into_full() {
+            runtime.browser_command = browser
+                .command
+                .as_deref()
+                .map(|value| non_empty_field(value, "browser.command"))
+                .transpose()?;
+            runtime.browser_urls = browser
+                .urls
+                .iter()
+                .map(|url| non_empty_field(url, "browser.urls[]"))
+                .collect::<Result<Vec<_>>>()?;
+            runtime.browser_isolate_profile = browser.isolate_profile;
+        }
     }
 
     Ok(runtime)
@@ -2235,6 +2828,9 @@ fn normalize_browser_url_to_project_origin(url: &str, project_origin: &str) -> S
 }
 
 fn build_shell_command_with_args(command: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        return command.to_string();
+    }
     let mut rendered = quote_shell_arg(command);
     for arg in args {
         rendered.push(' ');
@@ -2569,20 +3165,21 @@ fn expand_tilde(raw_path: &str) -> PathBuf {
     PathBuf::from(raw_path)
 }
 
-fn render_niri_fragment(projects: &BTreeMap<String, ProjectRecord>) -> String {
+fn render_niri_fragment(
+    projects: &BTreeMap<String, ProjectRecord>,
+    stopped_projects: &HashSet<String>,
+) -> String {
     let mut rendered = String::from("// generated by projd\n");
     for project in projects.values() {
-        // Index-based workspaces (e.g. "5") are positioned via IPC focus-workspace,
-        // not via named workspace declarations which shift index positions.
-        if is_index_workspace(&project.workspace) {
+        if stopped_projects.contains(&project.name) {
             continue;
         }
-        let workspace = escape_kdl_string(&project.workspace);
+        let ws_name = escape_kdl_string(niri_workspace_name(project));
         let title_pattern = escape_kdl_string(&project_title_match_pattern(&project.name));
-        rendered.push_str(&format!("workspace \"{workspace}\"\n"));
+        rendered.push_str(&format!("workspace \"{ws_name}\"\n"));
         rendered.push_str("window-rule {\n");
         rendered.push_str(&format!("  match title=\"{title_pattern}\"\n"));
-        rendered.push_str(&format!("  open-on-workspace \"{workspace}\"\n"));
+        rendered.push_str(&format!("  open-on-workspace \"{ws_name}\"\n"));
         rendered.push_str("}\n");
     }
     rendered
@@ -2590,6 +3187,16 @@ fn render_niri_fragment(projects: &BTreeMap<String, ProjectRecord>) -> String {
 
 fn is_index_workspace(workspace: &str) -> bool {
     workspace.parse::<u32>().is_ok_and(|n| n >= 1)
+}
+
+/// For index-based workspaces (e.g. "5"), the niri workspace is declared using
+/// the project name so it persists. For named workspaces, use the workspace value directly.
+fn niri_workspace_name(project: &ProjectRecord) -> &str {
+    if is_index_workspace(&project.workspace) {
+        &project.name
+    } else {
+        &project.workspace
+    }
 }
 
 fn project_title_match_pattern(project_name: &str) -> String {
@@ -2822,27 +3429,33 @@ fn focus_workspace_in_niri(workspace: &str) -> Result<()> {
             format!("failed to execute niri focus command for workspace '{workspace}'")
         })?;
 
-    if output.status.success() {
-        return Ok(());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            bail!("niri focus command failed for workspace '{workspace}'");
+        }
+        bail!("niri focus command failed for workspace '{workspace}': {stderr}");
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stderr.is_empty() {
-        bail!("niri focus command failed for workspace '{workspace}'");
-    }
+    Ok(())
+}
 
-    bail!("niri focus command failed for workspace '{workspace}': {stderr}")
+/// Focus the correct niri workspace for a project. Looks up the named workspace's
+/// current index and focuses by index (niri's focus-by-name silently no-ops).
+fn focus_project_workspace_in_niri(project: &ProjectRecord) -> Result<()> {
+    let ws_name = niri_workspace_name(project);
+    // niri's focus-workspace-by-name silently no-ops, so look up the current
+    // runtime index and focus by that instead.
+    if let Some(current_idx) = workspace_index_from_niri(ws_name) {
+        focus_workspace_in_niri(&current_idx.to_string())?;
+    } else {
+        focus_workspace_in_niri(ws_name)?;
+    }
+    Ok(())
 }
 
 fn surface_window_in_niri(workspace: &str) -> Result<bool> {
-    let workspace_id = if is_index_workspace(workspace) {
-        workspace
-            .parse::<u64>()
-            .ok()
-            .and_then(workspace_id_by_index_from_niri)
-    } else {
-        workspace_id_from_niri(workspace)
-    };
+    let workspace_id = workspace_id_from_niri(workspace);
     let Some(workspace_id) = workspace_id else {
         return Ok(false);
     };
@@ -2896,29 +3509,7 @@ fn workspace_id_from_niri(workspace: &str) -> Option<u64> {
     })
 }
 
-fn workspace_id_by_index_from_niri(index: u64) -> Option<u64> {
-    let output = Command::new(niri_binary())
-        .arg("msg")
-        .arg("--json")
-        .arg("workspaces")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
-    let workspaces = value.as_array()?;
-    workspaces.iter().find_map(|item| {
-        let object = item.as_object()?;
-        if object.get("idx")?.as_u64()? != index {
-            return None;
-        }
-        object.get("id")?.as_u64()
-    })
-}
-
 fn workspace_index_from_niri(workspace: &str) -> Option<u64> {
-    // For index-based workspaces, the configured value IS the index.
     if is_index_workspace(workspace) {
         return workspace.parse::<u64>().ok();
     }
@@ -3189,6 +3780,7 @@ mod tests {
             projects,
             focused_project: None,
             suspended_projects: HashSet::new(),
+            stopped_projects: HashSet::new(),
             state_path: PathBuf::from("/tmp/state.json"),
             niri_config_path: PathBuf::from("/tmp/config.kdl"),
             logs_path: PathBuf::from("/tmp/logs"),
@@ -3233,6 +3825,7 @@ mod tests {
             projects,
             focused_project: Some(project.name.clone()),
             suspended_projects: suspended,
+            stopped_projects: HashSet::new(),
             state_path: PathBuf::from("/tmp/state.json"),
             niri_config_path: PathBuf::from("/tmp/config.kdl"),
             logs_path: PathBuf::from("/tmp/logs"),
@@ -3319,6 +3912,89 @@ urls = [\"http://localhost:${PORT}\"]\n",
         assert_eq!(runtime.browser_command.as_deref(), Some("helium"));
         assert_eq!(runtime.browser_urls, vec!["http://localhost:${PORT}"]);
         assert!(runtime.browser_isolate_profile);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_project_config_infers_name_from_directory() {
+        let base = unique_temp_dir("infer-name");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join(".project.toml"), "server = \"npm run dev\"\n").unwrap();
+
+        let loaded = load_project_config(&base).unwrap();
+        let expected_name = base.file_name().unwrap().to_str().unwrap();
+        assert_eq!(loaded.name, expected_name);
+        assert_eq!(loaded.path, fs::canonicalize(&base).unwrap());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_project_config_server_shorthand() {
+        let base = unique_temp_dir("server-shorthand");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join(".project.toml"),
+            "name = \"demo\"\npath = \".\"\nserver = \"npm run dev\"\n",
+        )
+        .unwrap();
+
+        let loaded = load_project_config(&base).unwrap();
+        let server = loaded.runtime.server.unwrap();
+        assert_eq!(server.command, "npm run dev");
+        assert_eq!(server.port_env, "PORT");
+        assert!(server.ready_pattern.is_none());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_project_config_editor_shorthand() {
+        let base = unique_temp_dir("editor-shorthand");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join(".project.toml"),
+            "name = \"demo\"\npath = \".\"\neditor = \"code .\"\n",
+        )
+        .unwrap();
+
+        let loaded = load_project_config(&base).unwrap();
+        let editor = loaded.runtime.editor.unwrap();
+        assert_eq!(editor.command, "code .");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_project_config_browser_true() {
+        let base = unique_temp_dir("browser-true");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join(".project.toml"),
+            "name = \"demo\"\npath = \".\"\nbrowser = true\n",
+        )
+        .unwrap();
+
+        let loaded = load_project_config(&base).unwrap();
+        assert_eq!(loaded.runtime.browser_urls, vec!["${PROJ_ORIGIN}"]);
+        assert!(loaded.runtime.browser_isolate_profile);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_project_config_browser_false() {
+        let base = unique_temp_dir("browser-false");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join(".project.toml"),
+            "name = \"demo\"\npath = \".\"\nbrowser = false\n",
+        )
+        .unwrap();
+
+        let loaded = load_project_config(&base).unwrap();
+        assert!(loaded.runtime.browser_urls.is_empty());
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -3610,6 +4286,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             ],
             focused_project: Some("api".to_string()),
             suspended_projects: vec!["frontend".to_string(), "missing".to_string()],
+            stopped_projects: vec![],
         };
         fs::write(&state_path, serde_json::to_string(&persisted).unwrap()).unwrap();
 
@@ -3650,6 +4327,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             ],
             focused_project: Some("a".to_string()),
             suspended_projects: vec!["a".to_string()],
+            stopped_projects: vec![],
         };
         fs::write(&state_path, serde_json::to_string(&persisted).unwrap()).unwrap();
 
@@ -3699,6 +4377,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             projects,
             focused_project: Some("api".to_string()),
             suspended_projects,
+            stopped_projects: HashSet::new(),
             state_path: state_path.clone(),
             niri_config_path,
             logs_path: base.join("logs"),
@@ -3742,6 +4421,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             projects,
             focused_project: None,
             suspended_projects: HashSet::new(),
+            stopped_projects: HashSet::new(),
             state_path,
             niri_config_path,
             logs_path: base.join("logs"),
@@ -3882,6 +4562,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             projects,
             focused_project: None,
             suspended_projects: HashSet::new(),
+            stopped_projects: HashSet::new(),
             state_path: base.join("state.json"),
             niri_config_path: base.join("config.kdl"),
             logs_path: base.join("logs"),
@@ -3975,6 +4656,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             projects,
             focused_project: None,
             suspended_projects: HashSet::new(),
+            stopped_projects: HashSet::new(),
             state_path: base.join("state.json"),
             niri_config_path: base.join("config.kdl"),
             logs_path: base.join("logs"),
@@ -4014,6 +4696,155 @@ urls = [\"http://localhost:${PORT}\"]\n",
             Some(value) => std::env::set_var(key, value),
             None => std::env::remove_var(key),
         }
+    }
+
+    #[test]
+    fn extract_request_method_and_path_parses_request_line() {
+        let head = b"GET /style.css HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let (method, path) = extract_request_method_and_path(head).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/style.css");
+
+        let head = b"POST /api HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let (method, path) = extract_request_method_and_path(head).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/api");
+    }
+
+    #[test]
+    fn extract_content_length_parses_header() {
+        let head = b"POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 42\r\n\r\n";
+        assert_eq!(extract_content_length(head), Some(42));
+
+        let head = b"POST /api HTTP/1.1\r\ncontent-length: 100\r\n\r\n";
+        assert_eq!(extract_content_length(head), Some(100));
+
+        let head = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        assert_eq!(extract_content_length(head), None);
+    }
+
+    #[test]
+    fn is_bare_localhost_detects_bare_hosts() {
+        assert!(is_bare_localhost("localhost"));
+        assert!(is_bare_localhost("localhost:48080"));
+        assert!(is_bare_localhost("127.0.0.1"));
+        assert!(is_bare_localhost("127.0.0.1:48080"));
+        assert!(!is_bare_localhost("foo.localhost"));
+        assert!(!is_bare_localhost("foo.localhost:48080"));
+        assert!(!is_bare_localhost("example.com"));
+    }
+
+    #[test]
+    fn read_config_returns_project_toml_content() {
+        let base = unique_temp_dir("read-config");
+        fs::create_dir_all(&base).unwrap();
+        let config_content = "name = \"demo\"\nserver = \"npm run dev\"\n";
+        fs::write(base.join(".project.toml"), config_content).unwrap();
+
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "demo".to_string(),
+            ProjectRecord {
+                name: "demo".to_string(),
+                path: base.display().to_string(),
+                workspace: "demo".to_string(),
+                port: 3001,
+            },
+        );
+        let state = AppState {
+            projects,
+            focused_project: None,
+            suspended_projects: HashSet::new(),
+            stopped_projects: HashSet::new(),
+            state_path: base.join("state.json"),
+            niri_config_path: base.join("config.kdl"),
+            logs_path: base.join("logs"),
+            browser_profile_root: base.join("browser-profiles"),
+            router_port: DEFAULT_ROUTER_PORT,
+            router_routes: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_route_overrides: BTreeMap::new(),
+            runtime_processes: BTreeMap::new(),
+        };
+
+        let result = state.read_config("demo").unwrap();
+        assert_eq!(result.name, "demo");
+        assert_eq!(result.content, config_content);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_config_validates_toml_before_writing() {
+        let base = unique_temp_dir("write-config");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join(".project.toml"), "name = \"demo\"\n").unwrap();
+
+        let mut projects = BTreeMap::new();
+        projects.insert(
+            "demo".to_string(),
+            ProjectRecord {
+                name: "demo".to_string(),
+                path: base.display().to_string(),
+                workspace: "demo".to_string(),
+                port: 3001,
+            },
+        );
+        let state = AppState {
+            projects,
+            focused_project: None,
+            suspended_projects: HashSet::new(),
+            stopped_projects: HashSet::new(),
+            state_path: base.join("state.json"),
+            niri_config_path: base.join("config.kdl"),
+            logs_path: base.join("logs"),
+            browser_profile_root: base.join("browser-profiles"),
+            router_port: DEFAULT_ROUTER_PORT,
+            router_routes: Arc::new(Mutex::new(BTreeMap::new())),
+            runtime_route_overrides: BTreeMap::new(),
+            runtime_processes: BTreeMap::new(),
+        };
+
+        // Valid TOML should succeed
+        let new_content = "name = \"demo\"\nserver = \"bun run dev\"\n";
+        let result = state.write_config("demo", new_content).unwrap();
+        assert_eq!(result.name, "demo");
+        let written = fs::read_to_string(base.join(".project.toml")).unwrap();
+        assert_eq!(written, new_content);
+
+        // Invalid TOML should fail
+        let err = state.write_config("demo", "invalid = [").unwrap_err();
+        assert!(err.to_string().contains("invalid TOML"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn init_config_creates_default_when_missing() {
+        let base = unique_temp_dir("init-config-create");
+        fs::create_dir_all(&base).unwrap();
+
+        let result = init_config(&base.display().to_string()).unwrap();
+        assert!(result.created);
+        assert!(result.content.contains("name ="));
+
+        let on_disk = fs::read_to_string(base.join(".project.toml")).unwrap();
+        assert_eq!(on_disk, result.content);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn init_config_noop_when_exists() {
+        let base = unique_temp_dir("init-config-noop");
+        fs::create_dir_all(&base).unwrap();
+        let existing = "name = \"existing\"\n";
+        fs::write(base.join(".project.toml"), existing).unwrap();
+
+        let result = init_config(&base.display().to_string()).unwrap();
+        assert!(!result.created);
+        assert_eq!(result.content, existing);
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
