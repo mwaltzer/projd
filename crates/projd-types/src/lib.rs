@@ -21,6 +21,7 @@ pub const METHOD_INIT_CONFIG: &str = "init_config";
 pub const METHOD_REGISTER: &str = "register";
 pub const METHOD_UNREGISTER: &str = "unregister";
 pub const METHOD_BROWSE: &str = "browse";
+pub const METHOD_WRITE_INIT_CONFIG: &str = "write_init_config";
 
 pub const NIRI_MANAGED_START: &str = "// === PROJD MANAGED START (do not edit) ===";
 pub const NIRI_MANAGED_END: &str = "// === PROJD MANAGED END ===";
@@ -217,6 +218,17 @@ pub struct InitConfigResult {
     pub path: String,
     pub content: String,
     pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteInitConfigParams {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteInitConfigResult {
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
