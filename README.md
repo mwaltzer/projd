@@ -1,233 +1,286 @@
 # projd
 
-`projd` is a project-first environment manager for the Niri compositor.
+**One command to start, switch, and manage your project environments on [Niri](https://github.com/YaLTeR/niri).**
 
-- `projd`: daemon
-- `proj`: CLI client
-- `projd-types`: shared IPC/types crate
-
-## Getting started
+`projd` is a daemon + CLI that turns each project directory into a self-contained runtime environment: dedicated workspace, dev server with automatic port allocation, browser with isolated profile, editor, background agents, and a local `.localhost` router -- all from a single TOML file.
 
 ```bash
+cd ~/Code/my-app
+proj up          # start everything: server, browser, editor, workspace
+proj focus api   # jump to another project's workspace instantly
+proj status      # see what's running
+```
+
+![Web dashboard](docs/screenshots/web-dashboard.png)
+
+## Install
+
+Requires Rust toolchain and [mise](https://mise.jdx.dev).
+
+```bash
+git clone https://github.com/anthropics/projd.git
+cd projd
 mise run bootstrap
-mise run install-niri
-mise run build-link
-mise run daemon-start
-mise run ping
-proj --help
 ```
 
-`proj ping` autostarts `projd` if it is not running.
-`mise run bootstrap` also installs `proj`/`projd` into `~/.cargo/bin`.
-`mise run install-niri` installs managed Niri integration defaults (keybinding + status watch helper).
+This compiles and installs `proj`, `projd`, and `proj-tui` into `~/.cargo/bin`.
 
-## Problem solved: ding to exact context
-
-Typical flow after this slice:
+For Niri workspace integration (keybindings + status bar helper):
 
 ```bash
-# 1) runtime process exits -> desktop notification includes:
-#    "<project>: process failed" and "run `proj focus <project>` to jump back"
-
-# 2) jump directly to the right context
-proj focus app-suite
-
-# 3) confirm machine-readable state if needed
-proj status --json
+proj install niri
 ```
 
-`proj focus <name>` attempts to:
-1. Focus the Niri workspace for that project.
-2. Surface a relevant window in that workspace (best effort).
-3. Return structured status + warnings when any step is partially unavailable.
+## Quick start
 
-## First project onboarding
-
-One-line setup from a new project root:
+**1. Start a project from its directory:**
 
 ```bash
+cd ~/Code/frontend
 proj up
 ```
 
-If `.project.toml` is missing, `proj up` now creates it automatically, starts `projd` if needed, and registers the project.
-On Niri, `proj up` also attempts to reload Niri config and focus the project's workspace.
-If Niri IPC is unavailable, `proj up` still succeeds and prints warnings.
+This auto-creates `.project.toml` if missing, starts the daemon if needed, registers the project, allocates a port, and -- on Niri -- assigns a workspace and focuses it.
 
-Then verify current state:
+**2. Add a dev server and browser:**
 
-```bash
-proj status
-proj list
-```
-
-Lifecycle controls:
-
-```bash
-proj switch <name>
-proj focus <name>
-proj suspend <name>
-proj resume <name>
-```
-
-`proj up <name>` also works from any directory by resolving in this order:
-1. Existing registered project name in `projd`
-2. Local roots (`$PROJ_PROJECT_ROOTS`, colon-separated)
-3. Default root `~/Code/<name>`
-
-Niri config updates are scoped to:
-`// === PROJD MANAGED START (do not edit) ===`
-`// === PROJD MANAGED END ===`
-Everything outside those markers is left untouched.
-
-## Project config
-
-Each project is configured with `.project.toml` in the project root.
-
-Example:
+Edit `.project.toml`:
 
 ```toml
 name = "frontend"
-path = "."
-workspace = "5"
 
 [server]
 command = "npm run dev"
 port_env = "PORT"
-cwd = "."
 
 [browser]
-command = "helium"
 urls = ["${PROJ_ORIGIN}"]
-# optional; defaults to true
-isolate_profile = true
 ```
 
-`browser.command` is optional and project-local. If omitted, browser launch falls back to:
-1. `PROJD_BROWSER_CMD`
-2. `BROWSER`
-3. platform default (`xdg-open` on Linux, `open` on macOS)
-
-When `browser.isolate_profile = true` (default), `projd` auto-adds per-project isolation flags for common browser families (Chromium-like and Firefox-like) so `proj up` opens a fresh window tied to that project workspace. Set `isolate_profile = false` to keep raw browser command behavior.
-
-Runtime env/template variables:
-- `${PORT}`: project backend port (3001+ allocation)
-- `${PROJ_NAME}`: project name
-- `${PROJ_HOST}`: project hostname (`<project>.localhost`)
-- `${PROJ_ORIGIN}`/`${PROJ_URL}`: project origin (`http://<project>.localhost:<router-port>`)
-- `${PROJ_ROUTER_PORT}`: router listen port
-
-`projd` runs a local host router and maps `Host: <project>.localhost` to the project backend port. Router port defaults to `48080` and can be overridden with `PROJD_ROUTER_PORT` (or `projd --router-port <port>`).
-
-## Core commands
+Then restart:
 
 ```bash
-proj init
-proj up [path|name] [--workspace <workspace>]
-proj down <name>
-proj switch <name>
-proj focus <name>
-proj suspend <name>
-proj resume <name>
-proj peek <name>
-proj status [name] [--json] [--watch --interval-ms 1000]
-proj logs <name> [process] [--json] [--tail 200]
-proj list
-proj ping
-proj daemon start
-proj daemon stop
-proj daemon status
-proj install niri [--config <path>] [--interval-ms 1000]
-proj-tui
-```
-
-## Current scope
-
-Implemented:
-- Daemon IPC and autostart flow
-- Registry + persistence at `~/.local/share/projd/state.json`
-- Niri managed marker updates in `~/.config/niri/config.kdl`
-- Niri workspace focus workflow via `proj switch`/`proj resume`
-- Runtime state view via `proj peek` and `proj status`
-- Persisted focus/suspend lifecycle state across daemon restarts
-- Runtime process orchestration for `server`, `agents`, `terminals`, `editor`, and `browser` launch commands
-- Per-process log capture and retrieval via `proj logs`
-- Runtime exit/failure desktop notifications with project/process context and `proj focus <name>` jump hint
-- Dependency startup for `depends_on` (path dependencies, plus already-registered name dependencies)
-- Browser launch gating with `server.ready_pattern`
-- Machine-readable status output via `proj status --json` (for Quickshell/Waybar integrations)
-- Interactive terminal dashboard via `proj-tui`
-
-Not implemented yet:
-- Automatic discovery of non-registered name dependencies in `depends_on`
-- Niri event-stream driven state reconciliation
-
-## Development
-
-For contributor/automation workflow details, see `AGENTS.md`.
-
-Run the Niri workflow integration test with:
-
-```bash
-mise run test-integration
-```
-
-Run the terminal dashboard with:
-
-```bash
-mise run tui
-```
-
-Useful keys in `proj-tui`:
-- `j`/`k` or arrows: move selection
-- `g` / `G`: jump to first/last project
-- `enter`: switch to selected project
-- `p`: peek selected project state
-- `l`: load logs for selected project
-- `f`: enable/disable log-follow mode
-
-## Full Suite Demo
-
-A runnable end-to-end demo lives at `examples/full-suite`:
-
-```bash
-cd ~/Code/projd/examples/full-suite/app-suite
+proj down frontend
 proj up
 ```
 
-This starts:
-- path dependency startup (`dep-service`)
-- app server with `ready_pattern`
-- agent process
-- terminal process
-- editor command
-- browser URL launches
+The daemon allocates a port (3001+), injects it as `$PORT`, starts your server, waits for it to be ready, then opens `http://frontend.localhost:48080` in an isolated browser profile.
 
-## Quickshell Integration
-
-Use `proj status --json` as the polling source and call `proj focus <name>` (or `proj switch <name>`) for actions.
-
-Example polling command:
+**3. Switch between projects:**
 
 ```bash
-proj status --json
+proj switch api       # focus the api workspace
+proj focus frontend   # jump back to frontend + surface its windows
+proj list             # see all registered projects
 ```
 
-This returns compact JSON shaped like:
+## What problem does projd solve?
+
+Developers working on multiple projects simultaneously deal with:
+
+- **Repetitive startup rituals** -- open terminal, cd, start server, open browser, navigate to URL, open editor -- repeated for every project, every session
+- **Port collisions** -- "is my API on 3000 or 3001 today?"
+- **Window chaos** -- browser tabs and terminals from different projects mixed together across workspaces
+- **Lost context** -- a process crashes; which project was it? where do you go to fix it?
+
+projd fixes all of this. Each project gets:
+
+| What | How |
+|------|-----|
+| Deterministic port | Auto-allocated from 3001+, persisted across restarts |
+| Local hostname | `<project>.localhost` via built-in HTTP router on port 48080 |
+| Isolated browser | Per-project Chromium/Firefox profile, no cookie bleed |
+| Niri workspace | Auto-configured workspace with window routing rules |
+| Process lifecycle | Server, agents, terminals, editor -- started, monitored, logged |
+| Desktop notifications | Process failures include project name + `proj focus <name>` hint |
+| Machine-readable state | `proj status --json` for Waybar/Quickshell integration |
+
+## How it works
+
+```
+.project.toml          proj (CLI)            projd (daemon)
+┌──────────────┐      ┌──────────┐          ┌──────────────────┐
+│ name, server,│─────▶│ proj up  │──IPC────▶│ register project │
+│ browser,     │      │ proj     │  (Unix   │ allocate port    │
+│ agents, ...  │      │  focus   │  socket) │ spawn processes  │
+└──────────────┘      │ proj     │          │ update niri cfg  │
+                      │  status  │◀─────────│ route hostname   │
+                      └──────────┘          │ capture logs     │
+                                            │ broadcast SSE    │
+                                            └──────────────────┘
+                                                    │
+                                     ┌──────────────┼──────────────┐
+                                     ▼              ▼              ▼
+                              Niri workspace   HTTP router    Web UI
+                              focus + window   *.localhost    :48080
+                              routing rules    → backend
+```
+
+**Components:**
+
+- **`projd`** -- Background daemon. Manages the project registry, spawns/monitors processes, maintains the HTTP host router, serves the web UI, and broadcasts state changes via SSE.
+- **`proj`** -- CLI client. Sends commands to the daemon over a Unix socket. Auto-starts the daemon on first use.
+- **`proj-tui`** -- Terminal dashboard with vim-like keybindings for monitoring all projects.
+- **Web UI** -- Dashboard at `http://localhost:48080` for managing projects from the browser.
+
+## Project configuration
+
+Each project is defined by a `.project.toml` in its root directory.
+
+### Minimal
+
+```toml
+name = "my-app"
+```
+
+Running `proj up` in a directory with just this will register the project and allocate a port. The name defaults to the directory name if omitted.
+
+### Full example
+
+```toml
+name = "app-suite"
+workspace = "3"
+
+[server]
+command = "npm run dev"
+port_env = "PORT"
+ready_pattern = "ready on"
+cwd = "."
+
+[[agents]]
+name = "indexer"
+command = "node agent.js"
+
+[[terminals]]
+name = "shell"
+
+[editor]
+command = "code"
+args = ["."]
+
+[browser]
+urls = ["${PROJ_ORIGIN}", "https://github.com/org/app"]
+isolate_profile = true
+
+depends_on = ["../shared-api"]
+```
+
+### Template variables
+
+These are available in all command strings and URLs:
+
+| Variable | Value |
+|----------|-------|
+| `${PORT}` | Allocated backend port (3001+) |
+| `${PROJ_NAME}` | Project name |
+| `${PROJ_HOST}` | `<project>.localhost` |
+| `${PROJ_ORIGIN}` | `http://<project>.localhost:48080` |
+| `${PROJ_ROUTER_PORT}` | Router port (default 48080) |
+
+### Server readiness
+
+When `server.ready_pattern` is set, the daemon watches stdout for a matching line before launching the browser. This prevents opening a blank page before the server is ready.
+
+### Browser isolation
+
+When `browser.isolate_profile = true` (the default), projd auto-adds per-project profile flags for Chromium and Firefox family browsers. Each project gets its own cookies, localStorage, and session state.
+
+The browser command resolves from: `browser.command` > `$PROJD_BROWSER_CMD` > `$BROWSER` > system default.
+
+### Dependencies
+
+`depends_on` accepts paths to other project directories. The daemon starts dependencies first and waits for their servers to be ready before starting the dependent project.
+
+```toml
+depends_on = ["../shared-api", "../auth-service"]
+```
+
+## CLI reference
+
+```
+proj init                                    Create starter .project.toml
+proj up [path|name] [--workspace <ws>]       Register + start a project
+proj down <name>                             Stop a project
+proj list                                    List all registered projects
+proj status [name] [--json] [--watch]        Show lifecycle state
+proj logs <name> [process] [--tail N]        Show captured process logs
+proj switch <name>                           Switch active project (focus workspace)
+proj focus <name>                            Focus workspace + surface windows
+proj suspend <name>                          Suspend a project
+proj resume <name>                           Resume a suspended project
+proj peek <name>                             Inspect state without changing focus
+proj daemon start|stop|status                Manage the daemon
+proj install niri                            Install Niri integration
+proj-tui                                     Interactive terminal dashboard
+```
+
+`proj up <name>` resolves projects in this order:
+1. Already-registered project name
+2. Directories in `$PROJ_PROJECT_ROOTS` (colon-separated)
+3. `~/Code/<name>`
+
+## Web UI
+
+The daemon serves a dashboard at `http://localhost:48080` with real-time status updates via SSE.
+
+![Project config editor](docs/screenshots/web-config.png)
+
+Features: start/stop/focus/suspend projects, browse and add project directories, edit `.project.toml` in-place, view logs, and filter by state.
+
+![Add project wizard](docs/screenshots/web-add-project.png)
+
+## Status bar integration
+
+For Waybar, Quickshell, or custom dashboards:
+
+```bash
+# One-shot JSON status
+proj status --json
+
+# Streaming (newline-delimited JSON, updates every second)
+proj status --json --watch --interval-ms 1000
+```
+
+Output shape:
 
 ```json
 {"projects":[{"project":{"name":"frontend","path":"/home/me/Code/frontend","workspace":"frontend","port":3001},"state":"active","focused":true}]}
 ```
 
-For stream-based integrations (Waybar, Quickshell, custom dashboards), you can emit newline-delimited status snapshots:
+`proj install niri` also installs a `status-watch.sh` helper for this.
 
-```bash
-proj status --json --watch --interval-ms 1000
+## Niri integration
+
+projd manages a section of your Niri config (`~/.config/niri/config.kdl`) between markers:
+
+```
+// === PROJD MANAGED START (do not edit) ===
+// ... workspace declarations and window rules ...
+// === PROJD MANAGED END ===
 ```
 
-`proj install niri` also installs a helper script at `~/.config/proj/status-watch.sh` that runs this watch command.
+Everything outside these markers is untouched. The managed section auto-updates when projects are registered or removed.
 
-For machine-readable logs:
+## Development
 
 ```bash
-proj logs frontend --json --tail 200
+mise run build          # Type-check
+mise run build-link     # Full compile
+mise run test-run       # Run tests
+mise run test-integration  # Niri workflow integration tests
+mise run tui            # Run terminal dashboard
+mise run daemon         # Run daemon in foreground
 ```
+
+See `AGENTS.md` for contributor workflow details.
+
+### TUI keybindings
+
+| Key | Action |
+|-----|--------|
+| `j`/`k` or arrows | Move selection |
+| `g` / `G` | Jump to first/last |
+| `Enter` | Switch to selected project |
+| `p` | Peek project state |
+| `l` | Load logs |
+| `f` | Toggle log follow mode |
