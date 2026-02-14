@@ -97,24 +97,7 @@ projd fixes all of this. Each project gets:
 
 ## How it works
 
-```
-.project.toml          proj (CLI)            projd (daemon)
-┌──────────────┐      ┌──────────┐          ┌──────────────────┐
-│ name, server,│─────▶│ proj up  │──IPC────▶│ register project │
-│ browser,     │      │ proj     │  (Unix   │ allocate port    │
-│ agents, ...  │      │  focus   │  socket) │ spawn processes  │
-└──────────────┘      │ proj     │          │ update niri cfg  │
-                      │  status  │◀─────────│ route hostname   │
-                      └──────────┘          │ capture logs     │
-                                            │ broadcast SSE    │
-                                            └──────────────────┘
-                                                    │
-                                     ┌──────────────┼──────────────┐
-                                     ▼              ▼              ▼
-                              Niri workspace   HTTP router    Web UI
-                              focus + window   *.localhost    :48080
-                              routing rules    → backend
-```
+![Architecture](docs/screenshots/architecture.svg)
 
 **Components:**
 
