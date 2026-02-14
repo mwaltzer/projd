@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>projd</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="header-left">
+    <h1>projd</h1>
+  </div>
+  <div class="header-center">
+    <input type="text" id="search" placeholder="Search projects..." autocomplete="off" spellcheck="false">
+  </div>
+  <div class="header-right">
+    <span id="connection-status" class="status-dot connected" title="Connected"></span>
+  </div>
+</header>
+<nav class="filter-bar">
+  <div class="filter-tabs">
+    <button class="filter-tab active" data-filter="all">All</button>
+    <button class="filter-tab" data-filter="running">Running</button>
+    <button class="filter-tab" data-filter="stopped">Stopped</button>
+  </div>
+  <button id="add-project-btn" class="btn btn-primary">Add Project</button>
+</nav>
+<main>
+  <section id="projects"></section>
+</main>
+<div id="modal-backdrop" class="modal-backdrop" hidden></div>
+<div id="modal-container" class="modal-container" hidden></div>
+<div id="toast-container" class="toast-container"></div>
+<script src="/app.js"></script>
+</body>
+</html>
