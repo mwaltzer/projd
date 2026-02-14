@@ -10,6 +10,8 @@
 curl -fsSL https://raw.githubusercontent.com/mwaltzer/projd/main/scripts/install.sh | sh
 ```
 
+The installer downloads pre-built binaries, starts the daemon, and opens the web dashboard -- you'll see it immediately.
+
 Or build from source with Cargo:
 
 ```bash
@@ -191,6 +193,7 @@ proj resume <name>                           Resume a suspended project
 proj peek <name>                             Inspect state without changing focus
 proj daemon start|stop|status                Manage the daemon
 proj install niri                            Install Niri integration
+proj install systemd                         Auto-start projd on login
 proj-tui                                     Interactive terminal dashboard
 ```
 

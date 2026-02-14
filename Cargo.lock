@@ -550,6 +550,7 @@ dependencies = [
 name = "projd-types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "dirs",
  "serde",
  "serde_json",

@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use projd_types::{
-    default_niri_config_path, default_socket_path, DownParams, FocusResult, ListResult, LogsParams,
-    LogsResult, NameParams, ProjectLifecycleState, ProjectStatus, Request, Response, StatusParams,
+    client, default_niri_config_path, default_socket_path, DownParams, FocusResult, ListResult,
+    LogsParams, LogsResult, NameParams, ProjectRecord, ProjectStatus, Response, StatusParams,
     StatusResult, UpParams, UpResult, DEFAULT_ROUTER_PORT, METHOD_DOWN, METHOD_FOCUS, METHOD_LIST,
     METHOD_LOGS, METHOD_PEEK, METHOD_PING, METHOD_RESUME, METHOD_SHUTDOWN, METHOD_STATUS,
     METHOD_SUSPEND, METHOD_SWITCH, METHOD_UP, NIRI_INTEGRATION_END, NIRI_INTEGRATION_START,
@@ -10,9 +10,8 @@ use projd_types::{
 use serde_json::{json, Value};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -27,6 +26,20 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Debug, Clone, Args)]
+struct AutostartArgs {
+    #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
+    autostart: bool,
+    #[arg(long = "no-autostart")]
+    no_autostart: bool,
+}
+
+impl AutostartArgs {
+    fn resolve(&self) -> bool {
+        self.autostart && !self.no_autostart
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Create a starter .project.toml in the current directory.
@@ -37,71 +50,53 @@ enum Commands {
         path: Option<PathBuf>,
         #[arg(long, value_name = "WORKSPACE")]
         workspace: Option<String>,
-        #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
-        autostart: bool,
-        #[arg(long = "no-autostart")]
-        no_autostart: bool,
+        #[command(flatten)]
+        autostart: AutostartArgs,
     },
     Down {
         name: String,
-        #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
-        autostart: bool,
-        #[arg(long = "no-autostart")]
-        no_autostart: bool,
+        #[command(flatten)]
+        autostart: AutostartArgs,
     },
     List {
-        #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
-        autostart: bool,
-        #[arg(long = "no-autostart")]
-        no_autostart: bool,
+        #[command(flatten)]
+        autostart: AutostartArgs,
     },
     /// Switch active project state and focus its workspace.
     Switch {
         name: String,
-        #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
-        autostart: bool,
-        #[arg(long = "no-autostart")]
-        no_autostart: bool,
+        #[command(flatten)]
+        autostart: AutostartArgs,
     },
     /// Focus project context (workspace + best-effort window surfacing).
     Focus {
         name: String,
-        #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
-        autostart: bool,
-        #[arg(long = "no-autostart")]
-        no_autostart: bool,
+        #[command(flatten)]
+        autostart: AutostartArgs,
     },
     /// Mark a project as suspended.
     Suspend {
         name: String,
-        #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
-        autostart: bool,
-        #[arg(long = "no-autostart")]
-        no_autostart: bool,
+        #[command(flatten)]
+        autostart: AutostartArgs,
     },
     /// Resume a suspended project and focus it.
     Resume {
         name: String,
-        #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
-        autostart: bool,
-        #[arg(long = "no-autostart")]
-        no_autostart: bool,
+        #[command(flatten)]
+        autostart: AutostartArgs,
     },
     /// Inspect project runtime state without mutating focus.
     Peek {
         name: String,
-        #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
-        autostart: bool,
-        #[arg(long = "no-autostart")]
-        no_autostart: bool,
+        #[command(flatten)]
+        autostart: AutostartArgs,
     },
     /// Show project lifecycle state.
     Status {
         name: Option<String>,
-        #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
-        autostart: bool,
-        #[arg(long = "no-autostart")]
-        no_autostart: bool,
+        #[command(flatten)]
+        autostart: AutostartArgs,
         #[arg(long, default_value_t = false)]
         json: bool,
         #[arg(long, default_value_t = false)]
@@ -113,10 +108,8 @@ enum Commands {
     Logs {
         name: String,
         process: Option<String>,
-        #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
-        autostart: bool,
-        #[arg(long = "no-autostart")]
-        no_autostart: bool,
+        #[command(flatten)]
+        autostart: AutostartArgs,
         #[arg(long, default_value_t = false)]
         json: bool,
         #[arg(long)]
@@ -124,10 +117,8 @@ enum Commands {
     },
     /// Ping daemon health.
     Ping {
-        #[arg(long = "autostart", default_value_t = true, action = ArgAction::Set)]
-        autostart: bool,
-        #[arg(long = "no-autostart")]
-        no_autostart: bool,
+        #[command(flatten)]
+        autostart: AutostartArgs,
     },
     /// Manage daemon lifecycle.
     Daemon {
@@ -157,6 +148,8 @@ enum InstallCommand {
         #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
     },
+    /// Enable projd to start automatically on login via systemd.
+    Systemd,
 }
 
 fn main() -> Result<()> {
@@ -169,82 +162,36 @@ fn main() -> Result<()> {
             path,
             workspace,
             autostart,
-            no_autostart,
-        } => cmd_up(
-            &socket_path,
-            path,
-            workspace,
-            resolve_autostart(autostart, no_autostart),
-        ),
-        Commands::Down {
-            name,
-            autostart,
-            no_autostart,
-        } => cmd_down(
-            &socket_path,
-            &name,
-            resolve_autostart(autostart, no_autostart),
-        ),
-        Commands::List {
-            autostart,
-            no_autostart,
-        } => cmd_list(&socket_path, resolve_autostart(autostart, no_autostart)),
-        Commands::Switch {
-            name,
-            autostart,
-            no_autostart,
-        } => cmd_switch(
-            &socket_path,
-            &name,
-            resolve_autostart(autostart, no_autostart),
-        ),
-        Commands::Focus {
-            name,
-            autostart,
-            no_autostart,
-        } => cmd_focus(
-            &socket_path,
-            &name,
-            resolve_autostart(autostart, no_autostart),
-        ),
-        Commands::Suspend {
-            name,
-            autostart,
-            no_autostart,
-        } => cmd_suspend(
-            &socket_path,
-            &name,
-            resolve_autostart(autostart, no_autostart),
-        ),
-        Commands::Resume {
-            name,
-            autostart,
-            no_autostart,
-        } => cmd_resume(
-            &socket_path,
-            &name,
-            resolve_autostart(autostart, no_autostart),
-        ),
-        Commands::Peek {
-            name,
-            autostart,
-            no_autostart,
-        } => cmd_peek(
-            &socket_path,
-            &name,
-            resolve_autostart(autostart, no_autostart),
-        ),
+        } => cmd_up(&socket_path, path, workspace, autostart.resolve()),
+        Commands::Down { name, autostart } => {
+            cmd_down(&socket_path, &name, autostart.resolve())
+        }
+        Commands::List { autostart } => cmd_list(&socket_path, autostart.resolve()),
+        Commands::Switch { name, autostart } => {
+            cmd_name_status(&socket_path, METHOD_SWITCH, &name, autostart.resolve())
+        }
+        Commands::Focus { name, autostart } => {
+            cmd_focus(&socket_path, &name, autostart.resolve())
+        }
+        Commands::Suspend { name, autostart } => {
+            cmd_name_status(&socket_path, METHOD_SUSPEND, &name, autostart.resolve())
+        }
+        Commands::Resume { name, autostart } => {
+            cmd_name_status(&socket_path, METHOD_RESUME, &name, autostart.resolve())
+        }
+        Commands::Peek { name, autostart } => {
+            cmd_name_status(&socket_path, METHOD_PEEK, &name, autostart.resolve())
+        }
         Commands::Status {
             name,
             autostart,
-            no_autostart,
             json,
             watch,
             interval_ms,
         } => cmd_status_projects(
             &socket_path,
             name,
-            resolve_autostart(autostart, no_autostart),
+            autostart.resolve(),
             json,
             watch,
             interval_ms,
@@ -253,53 +200,60 @@ fn main() -> Result<()> {
             name,
             process,
             autostart,
-            no_autostart,
             json,
             tail,
         } => cmd_logs(
             &socket_path,
             &name,
             process.as_deref(),
-            resolve_autostart(autostart, no_autostart),
+            autostart.resolve(),
             json,
             tail,
         ),
-        Commands::Ping {
-            autostart,
-            no_autostart,
-        } => cmd_ping(&socket_path, resolve_autostart(autostart, no_autostart)),
+        Commands::Ping { autostart } => cmd_ping(&socket_path, autostart.resolve()),
         Commands::Daemon { command } => match command {
             DaemonCommand::Start => cmd_start(&socket_path),
             DaemonCommand::Stop => cmd_stop(&socket_path),
-            DaemonCommand::Status => cmd_status(&socket_path),
+            DaemonCommand::Status => cmd_daemon_status(&socket_path),
         },
         Commands::Install { command } => match command {
             InstallCommand::Niri {
                 config,
                 interval_ms,
             } => cmd_install_niri(config, interval_ms),
+            InstallCommand::Systemd => cmd_install_systemd(),
         },
     }
 }
 
-const fn resolve_autostart(autostart: bool, no_autostart: bool) -> bool {
-    autostart && !no_autostart
+fn rpc<P: serde::Serialize, R: serde::de::DeserializeOwned>(
+    socket_path: &Path,
+    method: &str,
+    params: &P,
+    autostart: bool,
+) -> Result<(R, bool)> {
+    let value = serde_json::to_value(params)
+        .with_context(|| format!("failed to serialize {method} params"))?;
+    let resp = client::request_with_autostart(socket_path, method, value, autostart)?;
+    let daemon_was_started = resp.daemon_was_started;
+    let result = client::parse_ok_response(resp.response)?;
+    Ok((result, daemon_was_started))
 }
 
 fn cmd_ping(socket_path: &Path, autostart: bool) -> Result<()> {
-    let resp = request_with_autostart(socket_path, METHOD_PING, Value::Null, autostart)?;
+    let resp = client::request_with_autostart(socket_path, METHOD_PING, Value::Null, autostart)?;
     print_ping(resp.response)
 }
 
 fn cmd_start(socket_path: &Path) -> Result<()> {
-    start_daemon(socket_path)?;
-    let _ = wait_for_ping(socket_path, Duration::from_secs(3))?;
+    client::start_daemon(socket_path)?;
+    let _ = client::wait_for_ping(socket_path, Duration::from_secs(3))?;
     println!("projd started ({})", socket_path.display());
     Ok(())
 }
 
 fn cmd_stop(socket_path: &Path) -> Result<()> {
-    let response = request(socket_path, METHOD_SHUTDOWN, Value::Null)
+    let response = client::request(socket_path, METHOD_SHUTDOWN, Value::Null)
         .with_context(|| format!("failed to stop daemon at {}", socket_path.display()))?;
     if !response.ok {
         bail!(
@@ -311,17 +265,12 @@ fn cmd_stop(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_status(socket_path: &Path) -> Result<()> {
-    match request(socket_path, METHOD_PING, Value::Null) {
-        Ok(_) => {
-            println!("running ({})", socket_path.display());
-            Ok(())
-        }
-        Err(_) => {
-            println!("stopped ({})", socket_path.display());
-            Ok(())
-        }
+fn cmd_daemon_status(socket_path: &Path) -> Result<()> {
+    match client::request(socket_path, METHOD_PING, Value::Null) {
+        Ok(_) => println!("running ({})", socket_path.display()),
+        Err(_) => println!("stopped ({})", socket_path.display()),
     }
+    Ok(())
 }
 
 fn cmd_init() -> Result<()> {
@@ -342,18 +291,15 @@ fn cmd_up(
     if let Some(created) = ensure_project_config_exists(&project_dir)? {
         println!("initialized {}", created.display());
     }
-    let params = UpParams {
-        path: project_dir.to_string_lossy().to_string(),
-        workspace,
-    };
-    let resp = request_with_autostart(
+    let (result, daemon_was_started): (UpResult, _) = rpc(
         socket_path,
         METHOD_UP,
-        serde_json::to_value(params).context("failed to serialize up params")?,
+        &UpParams {
+            path: project_dir.to_string_lossy().to_string(),
+            workspace,
+        },
         autostart,
     )?;
-    let daemon_was_started = resp.daemon_was_started;
-    let result: UpResult = parse_ok_response(resp.response)?;
 
     if result.created {
         println!(
@@ -389,16 +335,14 @@ fn cmd_up(
 }
 
 fn cmd_down(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
-    let resp = request_with_autostart(
+    let (result, _): (ProjectRecord, _) = rpc(
         socket_path,
         METHOD_DOWN,
-        serde_json::to_value(DownParams {
+        &DownParams {
             name: name.to_string(),
-        })
-        .context("failed to serialize down params")?,
+        },
         autostart,
     )?;
-    let result = parse_ok_response::<projd_types::ProjectRecord>(resp.response)?;
     println!(
         "removed {} workspace={} port={}",
         result.name, result.workspace, result.port
@@ -407,8 +351,7 @@ fn cmd_down(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
 }
 
 fn cmd_list(socket_path: &Path, autostart: bool) -> Result<()> {
-    let resp = request_with_autostart(socket_path, METHOD_LIST, Value::Null, autostart)?;
-    let result: ListResult = parse_ok_response(resp.response)?;
+    let (result, _): (ListResult, _) = rpc(socket_path, METHOD_LIST, &Value::Null, autostart)?;
     if result.projects.is_empty() {
         println!("no projects registered");
         return Ok(());
@@ -423,23 +366,33 @@ fn cmd_list(socket_path: &Path, autostart: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_switch(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
-    let status = request_name_status(socket_path, METHOD_SWITCH, name, autostart)?;
+fn cmd_name_status(
+    socket_path: &Path,
+    method: &str,
+    name: &str,
+    autostart: bool,
+) -> Result<()> {
+    let (status, _): (ProjectStatus, _) = rpc(
+        socket_path,
+        method,
+        &NameParams {
+            name: name.to_string(),
+        },
+        autostart,
+    )?;
     print_project_status(&status);
     Ok(())
 }
 
 fn cmd_focus(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
-    let resp = request_with_autostart(
+    let (result, _): (FocusResult, _) = rpc(
         socket_path,
         METHOD_FOCUS,
-        serde_json::to_value(NameParams {
+        &NameParams {
             name: name.to_string(),
-        })
-        .context("failed to serialize focus params")?,
+        },
         autostart,
     )?;
-    let result: FocusResult = parse_ok_response(resp.response)?;
     print_project_status(&result.status);
     println!(
         "focus workspace_focused={} windows_surfaced={}",
@@ -448,24 +401,6 @@ fn cmd_focus(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
     for warning in result.warnings {
         eprintln!("warning: {warning}");
     }
-    Ok(())
-}
-
-fn cmd_suspend(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
-    let status = request_name_status(socket_path, METHOD_SUSPEND, name, autostart)?;
-    print_project_status(&status);
-    Ok(())
-}
-
-fn cmd_resume(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
-    let status = request_name_status(socket_path, METHOD_RESUME, name, autostart)?;
-    print_project_status(&status);
-    Ok(())
-}
-
-fn cmd_peek(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
-    let status = request_name_status(socket_path, METHOD_PEEK, name, autostart)?;
-    print_project_status(&status);
     Ok(())
 }
 
@@ -507,16 +442,15 @@ fn request_status_result(
     name: Option<&str>,
     autostart: bool,
 ) -> Result<StatusResult> {
-    let resp = request_with_autostart(
+    let (result, _) = rpc(
         socket_path,
         METHOD_STATUS,
-        serde_json::to_value(StatusParams {
+        &StatusParams {
             name: name.map(ToString::to_string),
-        })
-        .context("failed to serialize status params")?,
+        },
         autostart,
     )?;
-    parse_ok_response(resp.response)
+    Ok(result)
 }
 
 fn cmd_logs(
@@ -527,17 +461,15 @@ fn cmd_logs(
     json_output: bool,
     tail: Option<usize>,
 ) -> Result<()> {
-    let resp = request_with_autostart(
+    let (mut logs, _): (LogsResult, _) = rpc(
         socket_path,
         METHOD_LOGS,
-        serde_json::to_value(LogsParams {
+        &LogsParams {
             name: name.to_string(),
             process: process.map(ToString::to_string),
-        })
-        .context("failed to serialize logs params")?,
+        },
         autostart,
     )?;
-    let mut logs: LogsResult = parse_ok_response(resp.response)?;
 
     if let Some(tail_lines) = tail {
         for item in &mut logs.logs {
@@ -586,30 +518,11 @@ fn tail_content_lines(content: &str, tail_lines: usize) -> String {
     rendered
 }
 
-fn request_name_status(
-    socket_path: &Path,
-    method: &str,
-    name: &str,
-    autostart: bool,
-) -> Result<ProjectStatus> {
-    let resp = request_with_autostart(
-        socket_path,
-        method,
-        serde_json::to_value(NameParams {
-            name: name.to_string(),
-        })
-        .context("failed to serialize command params")?,
-        autostart,
-    )?;
-
-    parse_ok_response(resp.response)
-}
-
 fn print_project_status(status: &ProjectStatus) {
     println!(
         "{}\tstate={}\tfocused={}\tworkspace={}\tport={}\tpath={}",
         status.project.name,
-        lifecycle_state_label(&status.state),
+        status.state.as_str(),
         status.focused,
         status.project.workspace,
         status.project.port,
@@ -631,7 +544,7 @@ fn format_status_output(result: &StatusResult, json_output: bool) -> Result<Stri
             output,
             "{}\tstate={}\tfocused={}\tworkspace={}\tport={}\tpath={}",
             status.project.name,
-            lifecycle_state_label(&status.state),
+            status.state.as_str(),
             status.focused,
             status.project.workspace,
             status.project.port,
@@ -639,15 +552,6 @@ fn format_status_output(result: &StatusResult, json_output: bool) -> Result<Stri
         );
     }
     Ok(output)
-}
-
-const fn lifecycle_state_label(state: &ProjectLifecycleState) -> &'static str {
-    match state {
-        ProjectLifecycleState::Active => "active",
-        ProjectLifecycleState::Backgrounded => "backgrounded",
-        ProjectLifecycleState::Suspended => "suspended",
-        ProjectLifecycleState::Stopped => "stopped",
-    }
 }
 
 fn resolve_project_dir(
@@ -721,8 +625,9 @@ fn try_find_project_path_by_name(
     name: &str,
     autostart: bool,
 ) -> Option<PathBuf> {
-    let resp = request_with_autostart(socket_path, METHOD_LIST, Value::Null, autostart).ok()?;
-    let listed: ListResult = parse_ok_response(resp.response).ok()?;
+    let resp =
+        client::request_with_autostart(socket_path, METHOD_LIST, Value::Null, autostart).ok()?;
+    let listed: ListResult = client::parse_ok_response(resp.response).ok()?;
     listed
         .projects
         .into_iter()
@@ -811,6 +716,78 @@ fn cmd_install_niri(config: Option<PathBuf>, interval_ms: u64) -> Result<()> {
     );
     println!("focus command: proj focus <project>");
     Ok(())
+}
+
+fn cmd_install_systemd() -> Result<()> {
+    let projd_path = resolve_projd_absolute_path()?;
+
+    let service_dir = systemd_user_dir();
+    fs::create_dir_all(&service_dir)
+        .with_context(|| format!("failed to create {}", service_dir.display()))?;
+
+    let service_path = service_dir.join("projd.service");
+    let unit = format!(
+        "[Unit]\n\
+         Description=projd project daemon\n\
+         \n\
+         [Service]\n\
+         ExecStart={}\n\
+         Restart=on-failure\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        projd_path.display()
+    );
+    fs::write(&service_path, &unit)
+        .with_context(|| format!("failed to write {}", service_path.display()))?;
+    println!("wrote {}", service_path.display());
+
+    let reload = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status()
+        .context("failed to run systemctl --user daemon-reload")?;
+    if !reload.success() {
+        bail!("systemctl --user daemon-reload failed");
+    }
+
+    let enable = Command::new("systemctl")
+        .args(["--user", "enable", "--now", "projd"])
+        .status()
+        .context("failed to run systemctl --user enable --now projd")?;
+    if !enable.success() {
+        bail!("systemctl --user enable --now projd failed");
+    }
+
+    println!("projd enabled and started via systemd user service");
+    Ok(())
+}
+
+fn resolve_projd_absolute_path() -> Result<PathBuf> {
+    if let Ok(output) = Command::new("which").arg("projd").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(PathBuf::from(path));
+            }
+        }
+    }
+    if let Some(local) = client::detect_local_projd_binary() {
+        return Ok(local);
+    }
+    bail!("could not find projd binary; ensure it is installed and on your PATH")
+}
+
+fn systemd_user_dir() -> PathBuf {
+    if let Some(value) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(value).join("systemd").join("user");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("systemd")
+            .join("user");
+    }
+    PathBuf::from(".config").join("systemd").join("user")
 }
 
 fn proj_config_dir() -> PathBuf {
@@ -940,17 +917,6 @@ fn render_default_project_config(_project_dir: &Path) -> String {
     "# name defaults to directory name\n# docs: https://github.com/mwaltzer/projd#configuration\n\nserver = \"npm run dev\"\n".to_string()
 }
 
-fn parse_ok_response<T: serde::de::DeserializeOwned>(response: Response) -> Result<T> {
-    if !response.ok {
-        bail!(
-            "daemon returned error: {}",
-            response.error.unwrap_or_else(|| "unknown".to_string())
-        );
-    }
-    serde_json::from_value(response.result.unwrap_or(Value::Null))
-        .context("failed to parse daemon response body")
-}
-
 fn print_ping(response: Response) -> Result<()> {
     if !response.ok {
         bail!(
@@ -964,69 +930,6 @@ fn print_ping(response: Response) -> Result<()> {
             .context("failed to format ping response")?
     );
     Ok(())
-}
-
-fn request(socket_path: &Path, method: &str, params: Value) -> Result<Response> {
-    let stream = UnixStream::connect(socket_path)
-        .with_context(|| format!("failed to connect to socket {}", socket_path.display()))?;
-    let mut writer = BufWriter::new(
-        stream
-            .try_clone()
-            .context("failed to clone socket stream")?,
-    );
-    let mut reader = BufReader::new(stream);
-
-    let req = Request {
-        id: 1,
-        method: method.to_string(),
-        params,
-    };
-
-    serde_json::to_writer(&mut writer, &req).context("failed to serialize request")?;
-    writer
-        .write_all(b"\n")
-        .context("failed to write request newline")?;
-    writer.flush().context("failed to flush request")?;
-
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .context("failed to read daemon response")?;
-    if line.trim().is_empty() {
-        bail!("daemon returned empty response");
-    }
-
-    serde_json::from_str::<Response>(&line).context("failed to parse daemon response")
-}
-
-struct AutostartResponse {
-    response: Response,
-    daemon_was_started: bool,
-}
-
-fn request_with_autostart(
-    socket_path: &Path,
-    method: &str,
-    params: Value,
-    autostart: bool,
-) -> Result<AutostartResponse> {
-    match request(socket_path, method, params.clone()) {
-        Ok(response) => Ok(AutostartResponse {
-            response,
-            daemon_was_started: false,
-        }),
-        Err(_) if autostart => {
-            eprintln!("daemon unavailable, starting projd...");
-            start_daemon(socket_path)?;
-            let _ = wait_for_ping(socket_path, Duration::from_secs(3))?;
-            let response = request(socket_path, method, params)?;
-            Ok(AutostartResponse {
-                response,
-                daemon_was_started: true,
-            })
-        }
-        Err(err) => Err(err),
-    }
 }
 
 fn open_url_in_browser(url: &str) {
@@ -1043,89 +946,10 @@ fn open_url_in_browser(url: &str) {
         .spawn();
 }
 
-fn wait_for_ping(socket_path: &Path, timeout: Duration) -> Result<Response> {
-    let attempts = (timeout.as_millis() / 100).max(1) as usize;
-    let mut last_error: Option<anyhow::Error> = None;
-
-    for _ in 0..attempts {
-        match request(socket_path, METHOD_PING, Value::Null) {
-            Ok(response) => return Ok(response),
-            Err(err) => {
-                last_error = Some(err);
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("timed out waiting for daemon")))
-}
-
-fn start_daemon(socket_path: &Path) -> Result<()> {
-    let spawn = Command::new("projd")
-        .arg("--socket")
-        .arg(socket_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    match spawn {
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(local_projd) = detect_local_projd_binary() {
-                let local_spawn = Command::new(local_projd)
-                    .arg("--socket")
-                    .arg(socket_path)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
-                if local_spawn.is_ok() {
-                    return Ok(());
-                }
-            }
-
-            Command::new("cargo")
-                .args(["run", "-q", "-p", "projd", "--", "--socket"])
-                .arg(socket_path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("failed to spawn projd via cargo fallback")?;
-            Ok(())
-        }
-        Err(err) => Err(err).context("failed to spawn projd"),
-    }
-}
-
-fn detect_local_projd_binary() -> Option<PathBuf> {
-    let current_exe = std::env::current_exe().ok()?;
-    let mut candidates = Vec::new();
-
-    if let Some(bin_dir) = current_exe.parent() {
-        candidates.push(bin_dir.join(projd_binary_name()));
-        if let Some(debug_dir) = bin_dir.parent() {
-            candidates.push(debug_dir.join(projd_binary_name()));
-        }
-    }
-
-    candidates.into_iter().find(|candidate| candidate.is_file())
-}
-
-#[cfg(unix)]
-const fn projd_binary_name() -> &'static str {
-    "projd"
-}
-
-#[cfg(windows)]
-const fn projd_binary_name() -> &'static str {
-    "projd.exe"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use projd_types::ProjectLifecycleState;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1234,7 +1058,7 @@ mod tests {
     fn format_status_output_supports_json_mode() {
         let result = StatusResult {
             projects: vec![ProjectStatus {
-                project: projd_types::ProjectRecord {
+                project: ProjectRecord {
                     name: "demo".to_string(),
                     workspace: "demo".to_string(),
                     port: 3001,
@@ -1254,7 +1078,7 @@ mod tests {
     fn format_status_output_supports_text_mode() {
         let result = StatusResult {
             projects: vec![ProjectStatus {
-                project: projd_types::ProjectRecord {
+                project: ProjectRecord {
                     name: "demo".to_string(),
                     workspace: "demo".to_string(),
                     port: 3001,
@@ -1335,14 +1159,12 @@ mod tests {
         let cli = Cli::try_parse_from(["proj", "focus", "frontend", "--no-autostart"]).unwrap();
         match cli.command {
             Commands::Focus {
-                name,
-                autostart,
-                no_autostart,
+                name, autostart, ..
             } => {
                 assert_eq!(name, "frontend");
-                assert!(autostart);
-                assert!(no_autostart);
-                assert!(!resolve_autostart(autostart, no_autostart));
+                assert!(autostart.autostart);
+                assert!(autostart.no_autostart);
+                assert!(!autostart.resolve());
             }
             _ => panic!("expected focus command"),
         }
@@ -1369,8 +1191,21 @@ mod tests {
                     assert_eq!(config, Some(PathBuf::from("/tmp/niri/config.kdl")));
                     assert_eq!(interval_ms, 750);
                 }
+                _ => panic!("expected install niri command"),
             },
-            _ => panic!("expected install niri command"),
+            _ => panic!("expected install command"),
+        }
+    }
+
+    #[test]
+    fn install_systemd_cli_parses() {
+        let cli = Cli::try_parse_from(["proj", "install", "systemd"]).unwrap();
+        match cli.command {
+            Commands::Install { command } => match command {
+                InstallCommand::Systemd => {}
+                _ => panic!("expected install systemd command"),
+            },
+            _ => panic!("expected install command"),
         }
     }
 
@@ -1396,25 +1231,19 @@ mod tests {
     fn ping_autostart_defaults_true_and_supports_disable_flags() {
         let default_cli = Cli::try_parse_from(["proj", "ping"]).unwrap();
         match default_cli.command {
-            Commands::Ping {
-                autostart,
-                no_autostart,
-            } => {
-                assert!(autostart);
-                assert!(!no_autostart);
+            Commands::Ping { ref autostart } => {
+                assert!(autostart.autostart);
+                assert!(!autostart.no_autostart);
             }
             _ => panic!("expected ping command"),
         }
 
         let no_autostart_cli = Cli::try_parse_from(["proj", "ping", "--no-autostart"]).unwrap();
         match no_autostart_cli.command {
-            Commands::Ping {
-                autostart,
-                no_autostart,
-            } => {
-                assert!(autostart);
-                assert!(no_autostart);
-                assert!(!resolve_autostart(autostart, no_autostart));
+            Commands::Ping { ref autostart } => {
+                assert!(autostart.autostart);
+                assert!(autostart.no_autostart);
+                assert!(!autostart.resolve());
             }
             _ => panic!("expected ping command"),
         }
@@ -1422,13 +1251,10 @@ mod tests {
         let explicit_false_cli =
             Cli::try_parse_from(["proj", "ping", "--autostart=false"]).unwrap();
         match explicit_false_cli.command {
-            Commands::Ping {
-                autostart,
-                no_autostart,
-            } => {
-                assert!(!autostart);
-                assert!(!no_autostart);
-                assert!(!resolve_autostart(autostart, no_autostart));
+            Commands::Ping { ref autostart } => {
+                assert!(!autostart.autostart);
+                assert!(!autostart.no_autostart);
+                assert!(!autostart.resolve());
             }
             _ => panic!("expected ping command"),
         }

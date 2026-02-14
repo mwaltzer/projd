@@ -798,11 +798,25 @@ fn is_state_mutating_method(method: &str) -> bool {
     )
 }
 
+fn respond_result<T: serde::Serialize>(id: u64, result: Result<T>) -> (Response, bool) {
+    match result {
+        Ok(value) => (
+            Response::ok(
+                id,
+                serde_json::to_value(value).unwrap_or_else(|_| json!({})),
+            ),
+            false,
+        ),
+        Err(err) => (Response::err(id, err.to_string()), false),
+    }
+}
+
 fn handle_request(request: &Request, app_state: &mut AppState) -> (Response, bool) {
+    let id = request.id;
     let result = match request.method.as_str() {
         METHOD_PING => (
             Response::ok(
-                request.id,
+                id,
                 json!({
                     "pong": true,
                     "daemon": "projd",
@@ -812,225 +826,95 @@ fn handle_request(request: &Request, app_state: &mut AppState) -> (Response, boo
             false,
         ),
         METHOD_SHUTDOWN => match app_state.shutdown() {
-            Ok(()) => (Response::ok(request.id, json!({"stopping": true})), true),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
+            Ok(()) => (Response::ok(id, json!({"stopping": true})), true),
+            Err(err) => (Response::err(id, err.to_string()), false),
         },
-        METHOD_UP => match parse_params::<UpParams>(&request.params)
-            .and_then(|params| app_state.up(params))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_DOWN => {
-            match parse_params::<DownParams>(&request.params)
-                .and_then(|params| app_state.down(params))
-            {
-                Ok(project) => (
-                    Response::ok(
-                        request.id,
-                        serde_json::to_value(project).unwrap_or_else(|_| json!({})),
-                    ),
-                    false,
-                ),
-                Err(err) => (Response::err(request.id, err.to_string()), false),
-            }
-        }
-        METHOD_LIST => {
-            let result = app_state.list();
-            (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            )
-        }
-        METHOD_SWITCH => match parse_params::<NameParams>(&request.params)
-            .and_then(|params| app_state.switch(&params.name))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_FOCUS => match parse_params::<NameParams>(&request.params)
-            .and_then(|params| app_state.focus(&params.name))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_SUSPEND => match parse_params::<NameParams>(&request.params)
-            .and_then(|params| app_state.suspend(&params.name))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_RESUME => match parse_params::<NameParams>(&request.params)
-            .and_then(|params| app_state.resume(&params.name))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_PEEK => match parse_params::<NameParams>(&request.params)
-            .and_then(|params| app_state.peek(&params.name))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_STATUS => match (if request.params.is_null() {
-            Ok(StatusParams { name: None })
-        } else {
-            parse_params::<StatusParams>(&request.params)
-        })
-        .and_then(|params| app_state.status(params.name.as_deref()))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_LOGS => match parse_params::<LogsParams>(&request.params)
-            .and_then(|params| app_state.logs(params))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_READ_CONFIG => match parse_params::<ReadConfigParams>(&request.params)
-            .and_then(|params| app_state.read_config(&params.name))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_WRITE_CONFIG => match parse_params::<WriteConfigParams>(&request.params)
-            .and_then(|params| app_state.write_config(&params.name, &params.content))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_INIT_CONFIG => match parse_params::<InitConfigParams>(&request.params)
-            .and_then(|params| init_config(&params.path))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_WRITE_INIT_CONFIG => {
-            match parse_params::<WriteInitConfigParams>(&request.params)
-                .and_then(|params| write_init_config(&params.path, &params.content))
-            {
-                Ok(result) => (
-                    Response::ok(
-                        request.id,
-                        serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                    ),
-                    false,
-                ),
-                Err(err) => (Response::err(request.id, err.to_string()), false),
-            }
-        }
-        METHOD_REGISTER => match parse_params::<RegisterParams>(&request.params)
-            .and_then(|params| app_state.register(params))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_UNREGISTER => match parse_params::<DownParams>(&request.params)
-            .and_then(|params| app_state.unregister(params))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
-        METHOD_BROWSE => match (if request.params.is_null() {
-            Ok(BrowseParams { path: None })
-        } else {
-            parse_params::<BrowseParams>(&request.params)
-        })
-        .and_then(|params| browse_directory(params))
-        {
-            Ok(result) => (
-                Response::ok(
-                    request.id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                ),
-                false,
-            ),
-            Err(err) => (Response::err(request.id, err.to_string()), false),
-        },
+        METHOD_UP => respond_result(
+            id,
+            parse_params::<UpParams>(&request.params).and_then(|p| app_state.up(p)),
+        ),
+        METHOD_DOWN => respond_result(
+            id,
+            parse_params::<DownParams>(&request.params).and_then(|p| app_state.down(p)),
+        ),
+        METHOD_LIST => respond_result(id, Ok(app_state.list())),
+        METHOD_SWITCH => respond_result(
+            id,
+            parse_params::<NameParams>(&request.params)
+                .and_then(|p| app_state.switch(&p.name)),
+        ),
+        METHOD_FOCUS => respond_result(
+            id,
+            parse_params::<NameParams>(&request.params)
+                .and_then(|p| app_state.focus(&p.name)),
+        ),
+        METHOD_SUSPEND => respond_result(
+            id,
+            parse_params::<NameParams>(&request.params)
+                .and_then(|p| app_state.suspend(&p.name)),
+        ),
+        METHOD_RESUME => respond_result(
+            id,
+            parse_params::<NameParams>(&request.params)
+                .and_then(|p| app_state.resume(&p.name)),
+        ),
+        METHOD_PEEK => respond_result(
+            id,
+            parse_params::<NameParams>(&request.params)
+                .and_then(|p| app_state.peek(&p.name)),
+        ),
+        METHOD_STATUS => respond_result(id, {
+            let params = if request.params.is_null() {
+                Ok(StatusParams { name: None })
+            } else {
+                parse_params::<StatusParams>(&request.params)
+            };
+            params.and_then(|p| app_state.status(p.name.as_deref()))
+        }),
+        METHOD_LOGS => respond_result(
+            id,
+            parse_params::<LogsParams>(&request.params).and_then(|p| app_state.logs(p)),
+        ),
+        METHOD_READ_CONFIG => respond_result(
+            id,
+            parse_params::<ReadConfigParams>(&request.params)
+                .and_then(|p| app_state.read_config(&p.name)),
+        ),
+        METHOD_WRITE_CONFIG => respond_result(
+            id,
+            parse_params::<WriteConfigParams>(&request.params)
+                .and_then(|p| app_state.write_config(&p.name, &p.content)),
+        ),
+        METHOD_INIT_CONFIG => respond_result(
+            id,
+            parse_params::<InitConfigParams>(&request.params)
+                .and_then(|p| init_config(&p.path)),
+        ),
+        METHOD_WRITE_INIT_CONFIG => respond_result(
+            id,
+            parse_params::<WriteInitConfigParams>(&request.params)
+                .and_then(|p| write_init_config(&p.path, &p.content)),
+        ),
+        METHOD_REGISTER => respond_result(
+            id,
+            parse_params::<RegisterParams>(&request.params)
+                .and_then(|p| app_state.register(p)),
+        ),
+        METHOD_UNREGISTER => respond_result(
+            id,
+            parse_params::<DownParams>(&request.params)
+                .and_then(|p| app_state.unregister(p)),
+        ),
+        METHOD_BROWSE => respond_result(id, {
+            let params = if request.params.is_null() {
+                Ok(BrowseParams { path: None })
+            } else {
+                parse_params::<BrowseParams>(&request.params)
+            };
+            params.and_then(browse_directory)
+        }),
         method => (
-            Response::err(request.id, format!("unknown method: {method}")),
+            Response::err(id, format!("unknown method: {method}")),
             false,
         ),
     };

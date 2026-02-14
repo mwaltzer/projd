@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -6,22 +6,18 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use projd_types::{
-    default_socket_path, DownParams, LogsParams, LogsResult, NameParams, ProjectLifecycleState,
-    ProjectStatus, Request, Response, StatusParams, StatusResult, UpParams, METHOD_DOWN,
-    METHOD_FOCUS, METHOD_LOGS, METHOD_PEEK, METHOD_PING, METHOD_RESUME, METHOD_STATUS,
-    METHOD_SUSPEND, METHOD_SWITCH, METHOD_UP,
+    client, default_socket_path, DownParams, LogsParams, LogsResult, NameParams,
+    ProjectLifecycleState, ProjectStatus, StatusParams, StatusResult, UpParams, METHOD_DOWN,
+    METHOD_FOCUS, METHOD_LOGS, METHOD_PEEK, METHOD_RESUME, METHOD_STATUS, METHOD_SUSPEND,
+    METHOD_SWITCH, METHOD_UP,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{backend::CrosstermBackend, Terminal};
-use serde_json::Value;
 use std::fmt::Write as _;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::os::unix::net::UnixStream;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Parser)]
@@ -119,6 +115,18 @@ const fn resolve_autostart(autostart: bool, no_autostart: bool) -> bool {
     autostart && !no_autostart
 }
 
+fn tui_rpc<P: serde::Serialize, R: serde::de::DeserializeOwned>(
+    socket_path: &Path,
+    method: &str,
+    params: &P,
+    autostart: bool,
+) -> Result<R> {
+    let value = serde_json::to_value(params)
+        .with_context(|| format!("failed to serialize {method} params"))?;
+    let resp = client::request_with_autostart(socket_path, method, value, autostart)?;
+    client::parse_ok_response(resp.response)
+}
+
 fn run_tui(socket_path: &Path, autostart: bool, refresh_ms: u64) -> Result<()> {
     let mut app = App::default();
     if let Err(err) = refresh_status(socket_path, autostart, &mut app) {
@@ -198,7 +206,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
             }
             Row::new([
                 Cell::from(status.project.name.as_str()),
-                Cell::from(lifecycle_state_label(&status.state)),
+                Cell::from(status.state.as_str()),
                 Cell::from(if status.focused { "yes" } else { "no" }),
                 Cell::from(status.project.port.to_string()),
                 Cell::from(status.project.workspace.as_str()),
@@ -355,18 +363,17 @@ fn handle_key(
         }
         KeyCode::Char('u') => {
             let cwd = std::env::current_dir().context("failed to resolve current directory")?;
-            let response = request_with_autostart(
+            let result: projd_types::UpResult = tui_rpc(
                 socket_path,
                 METHOD_UP,
-                serde_json::to_value(UpParams {
+                &UpParams {
                     path: cwd.to_string_lossy().to_string(),
                     workspace: None,
-                })
-                .context("failed to serialize up params")?,
+                },
                 autostart,
             )?;
-            let result: projd_types::UpResult = parse_ok_response(response)?;
-            app.status_message = format!("up {} (created={})", result.project.name, result.created);
+            app.status_message =
+                format!("up {} (created={})", result.project.name, result.created);
             refresh_all(socket_path, autostart, app)?;
         }
         KeyCode::Char('s') => {
@@ -383,14 +390,12 @@ fn handle_key(
                 app.status_message = "no project selected".to_string();
                 return Ok(false);
             };
-            let response = request_with_autostart(
+            let removed: projd_types::ProjectRecord = tui_rpc(
                 socket_path,
                 METHOD_DOWN,
-                serde_json::to_value(DownParams { name: name.clone() })
-                    .context("failed to serialize down params")?,
+                &DownParams { name: name.clone() },
                 autostart,
             )?;
-            let removed: projd_types::ProjectRecord = parse_ok_response(response)?;
             app.status_message = format!("down {}", removed.name);
             refresh_all(socket_path, autostart, app)?;
         }
@@ -428,14 +433,12 @@ fn invoke_selected_name_action(
         app.status_message = "no project selected".to_string();
         return Ok(());
     };
-    let response = request_with_autostart(
+    let _: ProjectStatus = tui_rpc(
         socket_path,
         method,
-        serde_json::to_value(NameParams { name: name.clone() })
-            .context("failed to serialize command params")?,
+        &NameParams { name: name.clone() },
         autostart,
     )?;
-    let _: ProjectStatus = parse_ok_response(response)?;
     app.status_message = format!("{method} {name}");
     refresh_all(socket_path, autostart, app)?;
     Ok(())
@@ -450,14 +453,8 @@ fn refresh_all(socket_path: &Path, autostart: bool, app: &mut App) -> Result<()>
 }
 
 fn refresh_status(socket_path: &Path, autostart: bool, app: &mut App) -> Result<()> {
-    let response = request_with_autostart(
-        socket_path,
-        METHOD_STATUS,
-        serde_json::to_value(StatusParams { name: None })
-            .context("failed to serialize status params")?,
-        autostart,
-    )?;
-    let status: StatusResult = parse_ok_response(response)?;
+    let status: StatusResult =
+        tui_rpc(socket_path, METHOD_STATUS, &StatusParams { name: None }, autostart)?;
     app.set_projects(status.projects);
     if app.projects.is_empty() {
         app.logs.clear();
@@ -471,17 +468,15 @@ fn load_selected_logs(socket_path: &Path, autostart: bool, app: &mut App) -> Res
         app.status_message = "no project selected".to_string();
         return Ok(());
     };
-    let response = request_with_autostart(
+    let logs: LogsResult = tui_rpc(
         socket_path,
         METHOD_LOGS,
-        serde_json::to_value(LogsParams {
+        &LogsParams {
             name: name.clone(),
             process: None,
-        })
-        .context("failed to serialize logs params")?,
+        },
         autostart,
     )?;
-    let logs: LogsResult = parse_ok_response(response)?;
     app.logs = render_logs(&logs);
     app.log_scroll = 0;
     app.status_message = format!("loaded logs for {name}");
@@ -507,151 +502,6 @@ fn render_logs(logs: &LogsResult) -> String {
         }
     }
     output
-}
-
-const fn lifecycle_state_label(state: &ProjectLifecycleState) -> &'static str {
-    match state {
-        ProjectLifecycleState::Active => "active",
-        ProjectLifecycleState::Backgrounded => "backgrounded",
-        ProjectLifecycleState::Suspended => "suspended",
-        ProjectLifecycleState::Stopped => "stopped",
-    }
-}
-
-fn request(socket_path: &Path, method: &str, params: Value) -> Result<Response> {
-    let stream = UnixStream::connect(socket_path)
-        .with_context(|| format!("failed to connect to socket {}", socket_path.display()))?;
-    let mut writer = BufWriter::new(
-        stream
-            .try_clone()
-            .context("failed to clone socket stream")?,
-    );
-    let mut reader = BufReader::new(stream);
-
-    let request = Request {
-        id: 1,
-        method: method.to_string(),
-        params,
-    };
-    serde_json::to_writer(&mut writer, &request).context("failed to serialize request")?;
-    writer
-        .write_all(b"\n")
-        .context("failed to write request newline")?;
-    writer.flush().context("failed to flush request")?;
-
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .context("failed to read daemon response")?;
-    if line.trim().is_empty() {
-        bail!("daemon returned empty response");
-    }
-    serde_json::from_str::<Response>(&line).context("failed to parse daemon response JSON")
-}
-
-fn parse_ok_response<T: serde::de::DeserializeOwned>(response: Response) -> Result<T> {
-    if !response.ok {
-        bail!(
-            "daemon returned error: {}",
-            response.error.unwrap_or_else(|| "unknown".to_string())
-        );
-    }
-    serde_json::from_value(response.result.unwrap_or(Value::Null))
-        .context("failed to parse daemon response")
-}
-
-fn request_with_autostart(
-    socket_path: &Path,
-    method: &str,
-    params: Value,
-    autostart: bool,
-) -> Result<Response> {
-    match request(socket_path, method, params.clone()) {
-        Ok(response) => Ok(response),
-        Err(_) if autostart => {
-            start_daemon(socket_path)?;
-            let _ = wait_for_ping(socket_path, Duration::from_secs(3))?;
-            request(socket_path, method, params)
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn wait_for_ping(socket_path: &Path, timeout: Duration) -> Result<Response> {
-    let attempts = (timeout.as_millis() / 100).max(1) as usize;
-    let mut last_error: Option<anyhow::Error> = None;
-    for _ in 0..attempts {
-        match request(socket_path, METHOD_PING, Value::Null) {
-            Ok(response) => return Ok(response),
-            Err(err) => {
-                last_error = Some(err);
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("timed out waiting for daemon")))
-}
-
-fn start_daemon(socket_path: &Path) -> Result<()> {
-    let spawn = Command::new("projd")
-        .arg("--socket")
-        .arg(socket_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    match spawn {
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(local_projd) = detect_local_projd_binary() {
-                let local_spawn = Command::new(local_projd)
-                    .arg("--socket")
-                    .arg(socket_path)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
-                if local_spawn.is_ok() {
-                    return Ok(());
-                }
-            }
-            Command::new("cargo")
-                .args(["run", "-q", "-p", "projd", "--", "--socket"])
-                .arg(socket_path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("failed to spawn projd via cargo fallback")?;
-            Ok(())
-        }
-        Err(err) => Err(err).context("failed to spawn projd"),
-    }
-}
-
-fn detect_local_projd_binary() -> Option<PathBuf> {
-    let current_exe = std::env::current_exe().ok()?;
-    let mut candidates = Vec::new();
-
-    if let Some(bin_dir) = current_exe.parent() {
-        candidates.push(bin_dir.join(projd_binary_name()));
-        if let Some(debug_dir) = bin_dir.parent() {
-            candidates.push(debug_dir.join(projd_binary_name()));
-        }
-    }
-
-    candidates.into_iter().find(|candidate| candidate.is_file())
-}
-
-#[cfg(unix)]
-const fn projd_binary_name() -> &'static str {
-    "projd"
-}
-
-#[cfg(windows)]
-const fn projd_binary_name() -> &'static str {
-    "projd.exe"
 }
 
 #[cfg(test)]

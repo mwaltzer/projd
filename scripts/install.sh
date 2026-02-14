@@ -66,7 +66,27 @@ chmod +x "$INSTALL_DIR/proj" "$INSTALL_DIR/projd" "$INSTALL_DIR/proj-tui"
 echo "Installed: proj, projd, proj-tui -> ${INSTALL_DIR}"
 
 # Check PATH
+IN_PATH=true
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
-  *) echo "Note: add ${INSTALL_DIR} to your PATH" ;;
+  *)
+    IN_PATH=false
+    echo "Note: add ${INSTALL_DIR} to your PATH"
+    ;;
 esac
+
+# Start daemon and open dashboard
+echo "Starting projd..."
+"$INSTALL_DIR/projd" > /dev/null 2>&1 &
+sleep 1
+DASHBOARD="http://localhost:48080"
+echo "dashboard: $DASHBOARD"
+if command -v xdg-open > /dev/null 2>&1; then
+  xdg-open "$DASHBOARD" > /dev/null 2>&1 || true
+elif command -v open > /dev/null 2>&1; then
+  open "$DASHBOARD" > /dev/null 2>&1 || true
+fi
+
+echo ""
+echo "To start projd automatically on login:"
+echo "  proj install systemd"
