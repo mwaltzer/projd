@@ -97,7 +97,7 @@ projd fixes all of this. Each project gets:
 
 ## How it works
 
-![Architecture](docs/screenshots/architecture.svg)
+<img width="2684" height="1542" alt="image" src="https://github.com/user-attachments/assets/79fad34b-0968-487a-b5f7-b1969670442a" />
 
 **Components:**
 
