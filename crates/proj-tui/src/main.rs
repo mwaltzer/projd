@@ -190,6 +190,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
                 ProjectLifecycleState::Active => Color::Green,
                 ProjectLifecycleState::Backgrounded => Color::Yellow,
                 ProjectLifecycleState::Suspended => Color::DarkGray,
+                ProjectLifecycleState::Stopped => Color::Red,
             };
             let mut style = Style::default().fg(state_color);
             if status.focused {
@@ -513,6 +514,7 @@ const fn lifecycle_state_label(state: &ProjectLifecycleState) -> &'static str {
         ProjectLifecycleState::Active => "active",
         ProjectLifecycleState::Backgrounded => "backgrounded",
         ProjectLifecycleState::Suspended => "suspended",
+        ProjectLifecycleState::Stopped => "stopped",
     }
 }
 

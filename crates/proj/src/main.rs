@@ -638,6 +638,7 @@ const fn lifecycle_state_label(state: &ProjectLifecycleState) -> &'static str {
         ProjectLifecycleState::Active => "active",
         ProjectLifecycleState::Backgrounded => "backgrounded",
         ProjectLifecycleState::Suspended => "suspended",
+        ProjectLifecycleState::Stopped => "stopped",
     }
 }
 
@@ -927,16 +928,8 @@ fn ensure_project_config_exists(project_dir: &Path) -> Result<Option<PathBuf>> {
     init_project_config(project_dir).map(Some)
 }
 
-fn render_default_project_config(project_dir: &Path) -> String {
-    let default_name = project_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("project");
-    format!(
-        "name = \"{name}\"\npath = \"{path}\"\nworkspace = \"{name}\"\n\n[server]\ncommand = \"cargo run\"\nport_env = \"PORT\"\ncwd = \".\"\n\n[browser]\nurls = [\"${{PROJ_ORIGIN}}\"]\n",
-        name = default_name,
-        path = project_dir.to_string_lossy()
-    )
+fn render_default_project_config(_project_dir: &Path) -> String {
+    "# name defaults to directory name\n# docs: https://github.com/mwaltzer/projd#configuration\n\nserver = \"npm run dev\"\n".to_string()
 }
 
 fn parse_ok_response<T: serde::de::DeserializeOwned>(response: Response) -> Result<T> {
@@ -1181,10 +1174,8 @@ mod tests {
 
         let toml_path = dir.join(".project.toml");
         let content = fs::read_to_string(&toml_path).unwrap();
-        assert!(content.contains("name = \""));
-        assert!(content.contains("proj-init-create"));
-        assert!(content.contains("workspace = \""));
-        assert!(content.contains("command = \"cargo run\""));
+        assert!(content.contains("server = \"npm run dev\""));
+        assert!(content.contains("# name defaults to directory name"));
 
         let _ = fs::remove_dir_all(&dir);
     }
