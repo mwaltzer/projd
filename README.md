@@ -15,17 +15,11 @@ proj status      # see what's running
 
 ## Install
 
-Requires Rust toolchain and [mise](https://mise.jdx.dev).
-
 ```bash
-git clone https://github.com/mwaltzer/projd.git
-cd projd
-mise run bootstrap
+cargo install --git https://github.com/mwaltzer/projd.git proj projd proj-tui
 ```
 
-This compiles and installs `proj`, `projd`, and `proj-tui` into `~/.cargo/bin`.
-
-For Niri workspace integration (keybindings + status bar helper):
+Optionally, install Niri workspace integration:
 
 ```bash
 proj install niri
@@ -33,22 +27,16 @@ proj install niri
 
 ## Quick start
 
-**1. Start a project from its directory:**
-
 ```bash
-cd ~/Code/frontend
-proj up
+cd ~/Code/my-app
+proj up                # registers project, allocates port, starts everything
 ```
 
-This auto-creates `.project.toml` if missing, starts the daemon if needed, registers the project, allocates a port, and -- on Niri -- assigns a workspace and focuses it.
+That's it. The daemon starts automatically. On Niri, it assigns a workspace and focuses it.
 
-**2. Add a dev server and browser:**
-
-Edit `.project.toml`:
+To add a dev server and browser, create `.project.toml` in the project root:
 
 ```toml
-name = "frontend"
-
 [server]
 command = "npm run dev"
 port_env = "PORT"
@@ -57,21 +45,14 @@ port_env = "PORT"
 urls = ["${PROJ_ORIGIN}"]
 ```
 
-Then restart:
+Then `proj up` again. The daemon allocates a port, injects it as `$PORT`, starts your server, and opens `http://my-app.localhost:48080` in an isolated browser.
+
+Switch between projects:
 
 ```bash
-proj down frontend
-proj up
-```
-
-The daemon allocates a port (3001+), injects it as `$PORT`, starts your server, waits for it to be ready, then opens `http://frontend.localhost:48080` in an isolated browser profile.
-
-**3. Switch between projects:**
-
-```bash
-proj switch api       # focus the api workspace
-proj focus frontend   # jump back to frontend + surface its windows
-proj list             # see all registered projects
+proj focus api         # jump to another project's workspace
+proj list              # see all registered projects
+proj status            # see what's running
 ```
 
 ## What problem does projd solve?
