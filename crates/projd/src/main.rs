@@ -6,10 +6,11 @@ use projd_types::{
     LogsParams, LogsResult, NameParams, PersistedState, ProcessLogs, ProjectLifecycleState,
     ProjectRecord, ProjectStatus, ReadConfigParams, ReadConfigResult, RegisterParams,
     RegisterResult, Request, Response, StatusParams, StatusResult, UpParams, UpResult,
-    WriteConfigParams, WriteConfigResult, METHOD_BROWSE, METHOD_DOWN, METHOD_FOCUS,
-    METHOD_INIT_CONFIG, METHOD_LIST, METHOD_LOGS, METHOD_PEEK, METHOD_PING, METHOD_READ_CONFIG,
-    METHOD_REGISTER, METHOD_RESUME, METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND, METHOD_SWITCH,
-    METHOD_UNREGISTER, METHOD_UP, METHOD_WRITE_CONFIG, NIRI_MANAGED_END, NIRI_MANAGED_START,
+    WriteConfigParams, WriteConfigResult, WriteInitConfigParams, WriteInitConfigResult,
+    METHOD_BROWSE, METHOD_DOWN, METHOD_FOCUS, METHOD_INIT_CONFIG, METHOD_LIST, METHOD_LOGS,
+    METHOD_PEEK, METHOD_PING, METHOD_READ_CONFIG, METHOD_REGISTER, METHOD_RESUME,
+    METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND, METHOD_SWITCH, METHOD_UNREGISTER, METHOD_UP,
+    METHOD_WRITE_CONFIG, METHOD_WRITE_INIT_CONFIG, NIRI_MANAGED_END, NIRI_MANAGED_START,
 };
 use regex::Regex;
 use serde::de::DeserializeOwned;
@@ -24,6 +25,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,6 +41,44 @@ const WEB_INDEX_HTML: &str = include_str!("../web/index.html");
 const WEB_STYLE_CSS: &str = include_str!("../web/style.css");
 const WEB_APP_JS: &str = include_str!("../web/app.js");
 const WEB_API_MAX_BODY: usize = 256 * 1024;
+const SSE_CHANNEL_BOUND: usize = 64;
+const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+struct SseBroadcast {
+    senders: Mutex<Vec<SyncSender<String>>>,
+}
+
+impl SseBroadcast {
+    fn new() -> Self {
+        Self {
+            senders: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn subscribe(&self) -> Receiver<String> {
+        let (tx, rx) = mpsc::sync_channel(SSE_CHANNEL_BOUND);
+        if let Ok(mut senders) = self.senders.lock() {
+            senders.push(tx);
+        }
+        rx
+    }
+
+    fn broadcast(&self, data: &str) {
+        if let Ok(mut senders) = self.senders.lock() {
+            senders.retain(|tx| tx.try_send(data.to_string()).is_ok());
+        }
+    }
+
+    fn broadcast_status(&self, projects: &[ProjectStatus]) {
+        let payload = serde_json::json!({
+            "type": "StatusChanged",
+            "projects": projects,
+        });
+        if let Ok(json) = serde_json::to_string(&payload) {
+            self.broadcast(&json);
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "projd", version, about = "Project daemon for proj CLI")]
@@ -70,11 +110,13 @@ fn main() -> Result<()> {
         .or_else(router_port_from_env)
         .unwrap_or(DEFAULT_ROUTER_PORT);
     let router_routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let sse_broadcast = Arc::new(SseBroadcast::new());
     let mut app_state = AppState::load(
         state_path,
         niri_config_path,
         router_port,
         router_routes.clone(),
+        sse_broadcast.clone(),
     )?;
     app_state.sync_router_routes()?;
     if let Err(err) = app_state.write_niri_config() {
@@ -103,6 +145,7 @@ fn main() -> Result<()> {
     install_signal_handler(running.clone());
     let router_running = running.clone();
     let router_socket_path = socket_path.clone();
+    let router_sse = sse_broadcast.clone();
     let router_handle = thread::spawn(move || {
         run_host_router(
             router_listener,
@@ -110,6 +153,7 @@ fn main() -> Result<()> {
             router_running,
             router_port,
             router_socket_path,
+            router_sse,
         )
     });
 
@@ -296,6 +340,7 @@ fn run_host_router(
     running: Arc<AtomicBool>,
     router_port: u16,
     socket_path: PathBuf,
+    sse_broadcast: Arc<SseBroadcast>,
 ) {
     info!("projd host router listening on 127.0.0.1:{router_port}");
     let active_streams = Arc::new(AtomicUsize::new(0));
@@ -316,9 +361,11 @@ fn run_host_router(
                 let routes = routes.clone();
                 let active_streams = active_streams.clone();
                 let socket_path = socket_path.clone();
+                let sse = sse_broadcast.clone();
                 thread::spawn(move || {
                     let _guard = RouterStreamGuard::new(active_streams);
-                    if let Err(err) = handle_host_router_stream(stream, routes, &socket_path) {
+                    if let Err(err) = handle_host_router_stream(stream, routes, &socket_path, &sse)
+                    {
                         warn!("host router stream failed: {err:#}");
                     }
                 });
@@ -354,6 +401,7 @@ fn handle_host_router_stream(
     mut client: TcpStream,
     routes: Arc<Mutex<BTreeMap<String, u16>>>,
     socket_path: &Path,
+    sse_broadcast: &SseBroadcast,
 ) -> Result<()> {
     client
         .set_read_timeout(Some(ROUTER_HEADER_TIMEOUT))
@@ -382,7 +430,7 @@ fn handle_host_router_stream(
     };
     let Some(route_key) = localhost_route_key_from_host(&host) else {
         if is_bare_localhost(&host) {
-            return handle_web_ui_request(&mut client, &initial, socket_path);
+            return handle_web_ui_request(&mut client, &initial, socket_path, sse_broadcast);
         }
         write_http_error(&mut client, "404 Not Found", "unknown project host route")?;
         return Ok(());
@@ -565,6 +613,7 @@ fn handle_web_ui_request(
     client: &mut TcpStream,
     head: &[u8],
     socket_path: &Path,
+    sse_broadcast: &SseBroadcast,
 ) -> Result<()> {
     let Some((method, path)) = extract_request_method_and_path(head) else {
         write_http_error(client, "400 Bad Request", "malformed request line")?;
@@ -575,8 +624,51 @@ fn handle_web_ui_request(
         ("GET", "/style.css") => write_http_response(client, "200 OK", "text/css; charset=utf-8", WEB_STYLE_CSS.as_bytes()),
         ("GET", "/app.js") => write_http_response(client, "200 OK", "application/javascript; charset=utf-8", WEB_APP_JS.as_bytes()),
         ("POST", "/api") => handle_web_api_request(client, head, socket_path),
+        ("GET", "/events") => handle_sse_stream(client, sse_broadcast),
         _ => write_http_error(client, "404 Not Found", "not found"),
     }
+}
+
+fn handle_sse_stream(client: &mut TcpStream, sse_broadcast: &SseBroadcast) -> Result<()> {
+    let header = "HTTP/1.1 200 OK\r\n\
+                   Content-Type: text/event-stream\r\n\
+                   Cache-Control: no-cache\r\n\
+                   Connection: keep-alive\r\n\
+                   Access-Control-Allow-Origin: *\r\n\r\n";
+    client
+        .write_all(header.as_bytes())
+        .context("failed to write SSE headers")?;
+    client.flush().context("failed to flush SSE headers")?;
+
+    let rx = sse_broadcast.subscribe();
+
+    loop {
+        match rx.recv_timeout(SSE_KEEPALIVE_INTERVAL) {
+            Ok(data) => {
+                let msg = format!("data: {data}\n\n");
+                if client.write_all(msg.as_bytes()).is_err() {
+                    break;
+                }
+                if client.flush().is_err() {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Send keepalive comment
+                if client.write_all(b": keepalive\n\n").is_err() {
+                    break;
+                }
+                if client.flush().is_err() {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn handle_web_api_request(
@@ -691,8 +783,23 @@ fn relay_rpc_to_socket(socket_path: &Path, request: &Request) -> Result<Vec<u8>>
     Ok(line.trim_end().as_bytes().to_vec())
 }
 
+fn is_state_mutating_method(method: &str) -> bool {
+    matches!(
+        method,
+        METHOD_UP
+            | METHOD_DOWN
+            | METHOD_SWITCH
+            | METHOD_FOCUS
+            | METHOD_SUSPEND
+            | METHOD_RESUME
+            | METHOD_REGISTER
+            | METHOD_UNREGISTER
+            | METHOD_WRITE_CONFIG
+    )
+}
+
 fn handle_request(request: &Request, app_state: &mut AppState) -> (Response, bool) {
-    match request.method.as_str() {
+    let result = match request.method.as_str() {
         METHOD_PING => (
             Response::ok(
                 request.id,
@@ -868,6 +975,20 @@ fn handle_request(request: &Request, app_state: &mut AppState) -> (Response, boo
             ),
             Err(err) => (Response::err(request.id, err.to_string()), false),
         },
+        METHOD_WRITE_INIT_CONFIG => {
+            match parse_params::<WriteInitConfigParams>(&request.params)
+                .and_then(|params| write_init_config(&params.path, &params.content))
+            {
+                Ok(result) => (
+                    Response::ok(
+                        request.id,
+                        serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+                    ),
+                    false,
+                ),
+                Err(err) => (Response::err(request.id, err.to_string()), false),
+            }
+        }
         METHOD_REGISTER => match parse_params::<RegisterParams>(&request.params)
             .and_then(|params| app_state.register(params))
         {
@@ -912,7 +1033,14 @@ fn handle_request(request: &Request, app_state: &mut AppState) -> (Response, boo
             Response::err(request.id, format!("unknown method: {method}")),
             false,
         ),
+    };
+
+    // Broadcast status update via SSE for state-mutating methods
+    if result.0.ok && is_state_mutating_method(&request.method) {
+        app_state.broadcast_current_status();
     }
+
+    result
 }
 
 fn browse_directory(params: BrowseParams) -> Result<BrowseResult> {
@@ -961,7 +1089,6 @@ fn parse_params<T: DeserializeOwned>(params: &serde_json::Value) -> Result<T> {
     serde_json::from_value(params.clone()).context("invalid request params")
 }
 
-#[derive(Debug)]
 struct AppState {
     projects: BTreeMap<String, ProjectRecord>,
     focused_project: Option<String>,
@@ -975,6 +1102,8 @@ struct AppState {
     router_routes: Arc<Mutex<BTreeMap<String, u16>>>,
     runtime_route_overrides: BTreeMap<String, u16>,
     runtime_processes: BTreeMap<String, Vec<RuntimeProcess>>,
+    sse_broadcast: Arc<SseBroadcast>,
+    log_file_sizes: BTreeMap<(String, String), u64>,
 }
 
 #[derive(Debug)]
@@ -1051,6 +1180,7 @@ impl AppState {
         niri_config_path: PathBuf,
         router_port: u16,
         router_routes: Arc<Mutex<BTreeMap<String, u16>>>,
+        sse_broadcast: Arc<SseBroadcast>,
     ) -> Result<Self> {
         let mut projects = BTreeMap::new();
         let mut focused_project: Option<String> = None;
@@ -1126,6 +1256,8 @@ impl AppState {
             router_routes,
             runtime_route_overrides: BTreeMap::new(),
             runtime_processes: BTreeMap::new(),
+            sse_broadcast,
+            log_file_sizes: BTreeMap::new(),
         })
     }
 
@@ -1659,6 +1791,7 @@ impl AppState {
 
     fn poll_runtime_events(&mut self) {
         let project_names: Vec<String> = self.runtime_processes.keys().cloned().collect();
+        let mut any_exited = false;
         for project_name in project_names {
             let Some(processes) = self.runtime_processes.remove(&project_name) else {
                 continue;
@@ -1668,6 +1801,7 @@ impl AppState {
             for mut process in processes {
                 match process.child.try_wait() {
                     Ok(Some(status)) => {
+                        any_exited = true;
                         let workspace_name = self
                             .projects
                             .get(&project_name)
@@ -1705,6 +1839,54 @@ impl AppState {
             } else if self.runtime_route_overrides.remove(&project_name).is_some() {
                 if let Err(err) = self.sync_router_routes() {
                     warn!("failed to sync router routes after runtime exit: {err}");
+                }
+            }
+        }
+
+        if any_exited {
+            self.broadcast_current_status();
+        }
+
+        // Check for log file growth and broadcast new content
+        self.poll_log_file_changes();
+    }
+
+    fn poll_log_file_changes(&mut self) {
+        for (project_name, processes) in &self.runtime_processes {
+            for process in processes {
+                let key = (project_name.clone(), process.name.clone());
+                let current_size = fs::metadata(&process.log_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let prev_size = self.log_file_sizes.get(&key).copied().unwrap_or(0);
+                if current_size > prev_size {
+                    // Read the new bytes
+                    if let Ok(mut file) = File::open(&process.log_path) {
+                        use std::io::Seek;
+                        if file.seek(io::SeekFrom::Start(prev_size)).is_ok() {
+                            let to_read = (current_size - prev_size).min(64 * 1024) as usize;
+                            let mut buf = vec![0u8; to_read];
+                            if let Ok(n) = file.read(&mut buf) {
+                                if n > 0 {
+                                    let content = String::from_utf8_lossy(&buf[..n]);
+                                    let payload = serde_json::json!({
+                                        "type": "LogsAppended",
+                                        "project": project_name,
+                                        "process": process.name,
+                                        "content": content,
+                                    });
+                                    if let Ok(json) = serde_json::to_string(&payload) {
+                                        self.sse_broadcast.broadcast(&json);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.log_file_sizes.insert(key, current_size);
+                } else if prev_size == 0 && current_size == 0 {
+                    // No change, nothing to do
+                } else {
+                    self.log_file_sizes.insert(key, current_size);
                 }
             }
         }
@@ -1750,6 +1932,15 @@ impl AppState {
             state,
             focused,
         }
+    }
+
+    fn broadcast_current_status(&self) {
+        let projects: Vec<ProjectStatus> = self
+            .projects
+            .values()
+            .map(|project| self.project_status(project))
+            .collect();
+        self.sse_broadcast.broadcast_status(&projects);
     }
 
     fn refresh_focused_project_from_niri(&mut self) {
@@ -2413,6 +2604,25 @@ fn init_config(path: &str) -> Result<InitConfigResult> {
         path: path_to_string(&config_path),
         content,
         created: true,
+    })
+}
+
+fn write_init_config(path: &str, content: &str) -> Result<WriteInitConfigResult> {
+    let expanded = expand_tilde(path);
+    let target = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .context("failed to determine current directory")?
+            .join(expanded)
+    };
+    // Validate that the content is valid TOML
+    content
+        .parse::<toml::Table>()
+        .context("invalid TOML content")?;
+    atomic_write_file(&target, content.as_bytes())?;
+    Ok(WriteInitConfigResult {
+        path: path_to_string(&target),
     })
 }
 
@@ -3789,6 +3999,8 @@ mod tests {
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_route_overrides: BTreeMap::new(),
             runtime_processes: BTreeMap::new(),
+            sse_broadcast: Arc::new(SseBroadcast::new()),
+            log_file_sizes: BTreeMap::new(),
         };
         assert_eq!(state.allocate_port().unwrap(), 3002);
     }
@@ -3834,6 +4046,8 @@ mod tests {
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_route_overrides: BTreeMap::new(),
             runtime_processes: BTreeMap::new(),
+            sse_broadcast: Arc::new(SseBroadcast::new()),
+            log_file_sizes: BTreeMap::new(),
         };
 
         let status = state.project_status(&project);
@@ -4295,6 +4509,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             niri_config_path,
             DEFAULT_ROUTER_PORT,
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(SseBroadcast::new()),
         )
         .unwrap();
         assert_eq!(loaded.focused_project.as_deref(), Some("api"));
@@ -4336,6 +4551,7 @@ urls = [\"http://localhost:${PORT}\"]\n",
             niri_config_path,
             DEFAULT_ROUTER_PORT,
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(SseBroadcast::new()),
         )
         .unwrap();
         assert_eq!(loaded.focused_project.as_deref(), Some("b"));
@@ -4386,6 +4602,8 @@ urls = [\"http://localhost:${PORT}\"]\n",
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_route_overrides: BTreeMap::new(),
             runtime_processes: BTreeMap::new(),
+            sse_broadcast: Arc::new(SseBroadcast::new()),
+            log_file_sizes: BTreeMap::new(),
         };
         state.persist_state().unwrap();
 
@@ -4430,6 +4648,8 @@ urls = [\"http://localhost:${PORT}\"]\n",
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_route_overrides: BTreeMap::new(),
             runtime_processes: BTreeMap::new(),
+            sse_broadcast: Arc::new(SseBroadcast::new()),
+            log_file_sizes: BTreeMap::new(),
         };
 
         let result = state.focus("demo").unwrap();
@@ -4571,6 +4791,8 @@ urls = [\"http://localhost:${PORT}\"]\n",
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_route_overrides: BTreeMap::new(),
             runtime_processes,
+            sse_broadcast: Arc::new(SseBroadcast::new()),
+            log_file_sizes: BTreeMap::new(),
         };
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -4665,6 +4887,8 @@ urls = [\"http://localhost:${PORT}\"]\n",
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_route_overrides: BTreeMap::new(),
             runtime_processes,
+            sse_broadcast: Arc::new(SseBroadcast::new()),
+            log_file_sizes: BTreeMap::new(),
         };
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -4764,6 +4988,8 @@ urls = [\"http://localhost:${PORT}\"]\n",
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_route_overrides: BTreeMap::new(),
             runtime_processes: BTreeMap::new(),
+            sse_broadcast: Arc::new(SseBroadcast::new()),
+            log_file_sizes: BTreeMap::new(),
         };
 
         let result = state.read_config("demo").unwrap();
@@ -4802,6 +5028,8 @@ urls = [\"http://localhost:${PORT}\"]\n",
             router_routes: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_route_overrides: BTreeMap::new(),
             runtime_processes: BTreeMap::new(),
+            sse_broadcast: Arc::new(SseBroadcast::new()),
+            log_file_sizes: BTreeMap::new(),
         };
 
         // Valid TOML should succeed
