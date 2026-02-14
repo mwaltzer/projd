@@ -3,9 +3,9 @@ use clap::{ArgAction, Parser, Subcommand};
 use projd_types::{
     default_niri_config_path, default_socket_path, DownParams, FocusResult, ListResult, LogsParams,
     LogsResult, NameParams, ProjectLifecycleState, ProjectStatus, Request, Response, StatusParams,
-    StatusResult, UpParams, UpResult, METHOD_DOWN, METHOD_FOCUS, METHOD_LIST, METHOD_LOGS,
-    METHOD_PEEK, METHOD_PING, METHOD_RESUME, METHOD_SHUTDOWN, METHOD_STATUS, METHOD_SUSPEND,
-    METHOD_SWITCH, METHOD_UP, NIRI_INTEGRATION_END, NIRI_INTEGRATION_START,
+    StatusResult, UpParams, UpResult, DEFAULT_ROUTER_PORT, METHOD_DOWN, METHOD_FOCUS, METHOD_LIST,
+    METHOD_LOGS, METHOD_PEEK, METHOD_PING, METHOD_RESUME, METHOD_SHUTDOWN, METHOD_STATUS,
+    METHOD_SUSPEND, METHOD_SWITCH, METHOD_UP, NIRI_INTEGRATION_END, NIRI_INTEGRATION_START,
 };
 use serde_json::{json, Value};
 use std::fmt::Write as _;
@@ -287,8 +287,8 @@ const fn resolve_autostart(autostart: bool, no_autostart: bool) -> bool {
 }
 
 fn cmd_ping(socket_path: &Path, autostart: bool) -> Result<()> {
-    let response = request_with_autostart(socket_path, METHOD_PING, Value::Null, autostart)?;
-    print_ping(response)
+    let resp = request_with_autostart(socket_path, METHOD_PING, Value::Null, autostart)?;
+    print_ping(resp.response)
 }
 
 fn cmd_start(socket_path: &Path) -> Result<()> {
@@ -346,13 +346,14 @@ fn cmd_up(
         path: project_dir.to_string_lossy().to_string(),
         workspace,
     };
-    let response = request_with_autostart(
+    let resp = request_with_autostart(
         socket_path,
         METHOD_UP,
         serde_json::to_value(params).context("failed to serialize up params")?,
         autostart,
     )?;
-    let result: UpResult = parse_ok_response(response)?;
+    let daemon_was_started = resp.daemon_was_started;
+    let result: UpResult = parse_ok_response(resp.response)?;
 
     if result.created {
         println!(
@@ -373,6 +374,13 @@ fn cmd_up(
     if !result.local_origin.is_empty() {
         println!("origin: {}", result.local_origin);
     }
+
+    let dashboard_url = format!("http://localhost:{DEFAULT_ROUTER_PORT}");
+    println!("dashboard: {dashboard_url}");
+    if daemon_was_started {
+        open_url_in_browser(&dashboard_url);
+    }
+
     for warning in result.warnings {
         eprintln!("warning: {warning}");
     }
@@ -381,7 +389,7 @@ fn cmd_up(
 }
 
 fn cmd_down(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
-    let response = request_with_autostart(
+    let resp = request_with_autostart(
         socket_path,
         METHOD_DOWN,
         serde_json::to_value(DownParams {
@@ -390,7 +398,7 @@ fn cmd_down(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
         .context("failed to serialize down params")?,
         autostart,
     )?;
-    let result = parse_ok_response::<projd_types::ProjectRecord>(response)?;
+    let result = parse_ok_response::<projd_types::ProjectRecord>(resp.response)?;
     println!(
         "removed {} workspace={} port={}",
         result.name, result.workspace, result.port
@@ -399,8 +407,8 @@ fn cmd_down(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
 }
 
 fn cmd_list(socket_path: &Path, autostart: bool) -> Result<()> {
-    let response = request_with_autostart(socket_path, METHOD_LIST, Value::Null, autostart)?;
-    let result: ListResult = parse_ok_response(response)?;
+    let resp = request_with_autostart(socket_path, METHOD_LIST, Value::Null, autostart)?;
+    let result: ListResult = parse_ok_response(resp.response)?;
     if result.projects.is_empty() {
         println!("no projects registered");
         return Ok(());
@@ -422,7 +430,7 @@ fn cmd_switch(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
 }
 
 fn cmd_focus(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
-    let response = request_with_autostart(
+    let resp = request_with_autostart(
         socket_path,
         METHOD_FOCUS,
         serde_json::to_value(NameParams {
@@ -431,7 +439,7 @@ fn cmd_focus(socket_path: &Path, name: &str, autostart: bool) -> Result<()> {
         .context("failed to serialize focus params")?,
         autostart,
     )?;
-    let result: FocusResult = parse_ok_response(response)?;
+    let result: FocusResult = parse_ok_response(resp.response)?;
     print_project_status(&result.status);
     println!(
         "focus workspace_focused={} windows_surfaced={}",
@@ -499,7 +507,7 @@ fn request_status_result(
     name: Option<&str>,
     autostart: bool,
 ) -> Result<StatusResult> {
-    let response = request_with_autostart(
+    let resp = request_with_autostart(
         socket_path,
         METHOD_STATUS,
         serde_json::to_value(StatusParams {
@@ -508,7 +516,7 @@ fn request_status_result(
         .context("failed to serialize status params")?,
         autostart,
     )?;
-    parse_ok_response(response)
+    parse_ok_response(resp.response)
 }
 
 fn cmd_logs(
@@ -519,7 +527,7 @@ fn cmd_logs(
     json_output: bool,
     tail: Option<usize>,
 ) -> Result<()> {
-    let response = request_with_autostart(
+    let resp = request_with_autostart(
         socket_path,
         METHOD_LOGS,
         serde_json::to_value(LogsParams {
@@ -529,7 +537,7 @@ fn cmd_logs(
         .context("failed to serialize logs params")?,
         autostart,
     )?;
-    let mut logs: LogsResult = parse_ok_response(response)?;
+    let mut logs: LogsResult = parse_ok_response(resp.response)?;
 
     if let Some(tail_lines) = tail {
         for item in &mut logs.logs {
@@ -584,7 +592,7 @@ fn request_name_status(
     name: &str,
     autostart: bool,
 ) -> Result<ProjectStatus> {
-    let response = request_with_autostart(
+    let resp = request_with_autostart(
         socket_path,
         method,
         serde_json::to_value(NameParams {
@@ -594,7 +602,7 @@ fn request_name_status(
         autostart,
     )?;
 
-    parse_ok_response(response)
+    parse_ok_response(resp.response)
 }
 
 fn print_project_status(status: &ProjectStatus) {
@@ -713,8 +721,8 @@ fn try_find_project_path_by_name(
     name: &str,
     autostart: bool,
 ) -> Option<PathBuf> {
-    let response = request_with_autostart(socket_path, METHOD_LIST, Value::Null, autostart).ok()?;
-    let listed: ListResult = parse_ok_response(response).ok()?;
+    let resp = request_with_autostart(socket_path, METHOD_LIST, Value::Null, autostart).ok()?;
+    let listed: ListResult = parse_ok_response(resp.response).ok()?;
     listed
         .projects
         .into_iter()
@@ -991,22 +999,48 @@ fn request(socket_path: &Path, method: &str, params: Value) -> Result<Response> 
     serde_json::from_str::<Response>(&line).context("failed to parse daemon response")
 }
 
+struct AutostartResponse {
+    response: Response,
+    daemon_was_started: bool,
+}
+
 fn request_with_autostart(
     socket_path: &Path,
     method: &str,
     params: Value,
     autostart: bool,
-) -> Result<Response> {
+) -> Result<AutostartResponse> {
     match request(socket_path, method, params.clone()) {
-        Ok(response) => Ok(response),
+        Ok(response) => Ok(AutostartResponse {
+            response,
+            daemon_was_started: false,
+        }),
         Err(_) if autostart => {
             eprintln!("daemon unavailable, starting projd...");
             start_daemon(socket_path)?;
             let _ = wait_for_ping(socket_path, Duration::from_secs(3))?;
-            request(socket_path, method, params)
+            let response = request(socket_path, method, params)?;
+            Ok(AutostartResponse {
+                response,
+                daemon_was_started: true,
+            })
         }
         Err(err) => Err(err),
     }
+}
+
+fn open_url_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(not(target_os = "macos"))]
+    let cmd = "xdg-open";
+
+    let _ = Command::new(cmd)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn wait_for_ping(socket_path: &Path, timeout: Duration) -> Result<Response> {

@@ -23,6 +23,8 @@ pub const METHOD_UNREGISTER: &str = "unregister";
 pub const METHOD_BROWSE: &str = "browse";
 pub const METHOD_WRITE_INIT_CONFIG: &str = "write_init_config";
 
+pub const DEFAULT_ROUTER_PORT: u16 = 48080;
+
 pub const NIRI_MANAGED_START: &str = "// === PROJD MANAGED START (do not edit) ===";
 pub const NIRI_MANAGED_END: &str = "// === PROJD MANAGED END ===";
 pub const NIRI_INTEGRATION_START: &str = "// === PROJD NIRI INTEGRATION START (do not edit) ===";

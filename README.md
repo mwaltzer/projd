@@ -7,6 +7,12 @@
 ## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/mwaltzer/projd/main/scripts/install.sh | sh
+```
+
+Or build from source with Cargo:
+
+```bash
 cargo install --git https://github.com/mwaltzer/projd.git proj projd proj-tui
 ```
 
@@ -17,9 +23,9 @@ cd ~/Code/my-app
 proj up
 ```
 
-That's it. The daemon starts automatically, registers the project, allocates a port, and on Niri assigns a workspace.
+That's it. The daemon starts automatically, registers the project, allocates a port, opens the web dashboard, and on Niri assigns a workspace.
 
-Open `http://localhost:48080` to manage everything from the browser:
+The dashboard at `http://localhost:48080` lets you manage everything from the browser:
 
 ![Web dashboard](docs/screenshots/web-dashboard.png)
 
@@ -213,15 +219,44 @@ Output shape:
 
 ## Niri integration
 
+projd is designed for the [Niri](https://github.com/YaLTeR/niri) Wayland compositor. Workspace features require Niri -- without it, projd still works for port allocation, process management, the HTTP router, and the web UI, but workspace assignment and window routing are skipped (commands like `proj focus` will succeed with warnings).
+
+### Workspace assignment
+
+Each project gets a dedicated Niri workspace. The workspace is chosen with this priority:
+
+1. **CLI override**: `proj up myapp --workspace 3`
+2. **Config file**: `workspace = "3"` in `.project.toml`
+3. **Project name**: defaults to the project name (e.g., project `frontend` gets workspace `frontend`)
+
+Each workspace can only belong to one project. Attempting to assign the same workspace to two projects will error.
+
+### Managed config section
+
 projd manages a section of your Niri config (`~/.config/niri/config.kdl`) between markers:
 
 ```
 // === PROJD MANAGED START (do not edit) ===
-// ... workspace declarations and window rules ...
+workspace "frontend"
+window-rule {
+  match title="^\\[proj:frontend\\]$"
+  open-on-workspace "frontend"
+}
 // === PROJD MANAGED END ===
 ```
 
-Everything outside these markers is untouched. The managed section auto-updates when projects are registered or removed.
+Everything outside these markers is untouched. The managed section auto-updates when projects are registered or removed. Stopped projects are removed from the managed section but stay registered in projd's state.
+
+### Window routing
+
+Windows are routed to the correct workspace via **title matching**. Spawned processes (terminals, editors, browsers) get their window title set to `[proj:<name>]`, which Niri matches against the generated `window-rule` patterns. Applications that don't support title injection won't be auto-routed.
+
+### Configuration
+
+| Setting | Default | Override |
+|---------|---------|----------|
+| Niri config path | `~/.config/niri/config.kdl` | `--niri-config` flag or `$PROJD_NIRI_CONFIG` |
+| Niri binary | `niri` | `$PROJD_NIRI_BIN` |
 
 ## Development
 
