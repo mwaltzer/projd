@@ -194,15 +194,7 @@ fn init_logging() {
 }
 
 fn install_signal_handler(running: Arc<AtomicBool>) {
-    static SIGNAL_FLAG: AtomicBool = AtomicBool::new(false);
-
-    // Store the Arc's inner pointer so the signal handler can set it.
-    // We leak a clone to keep it alive for the process lifetime.
-    let flag_ptr: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
-    // Wire the leaked flag to the actual running flag via a polling thread.
-    let poll_running = running;
-    // First, stash the pointer so the C handler can reach it.
-    SIGNAL_FLAG.store(true, Ordering::SeqCst);
+    static SIGNAL_FLAG: AtomicBool = AtomicBool::new(true);
 
     extern "C" fn handler(_sig: libc::c_int) {
         SIGNAL_FLAG.store(false, Ordering::SeqCst);
@@ -215,12 +207,11 @@ fn install_signal_handler(running: Arc<AtomicBool>) {
 
     // Background thread polls the signal flag and propagates to Arc<AtomicBool>.
     thread::spawn(move || {
-        let _ = flag_ptr; // keep alive
         while SIGNAL_FLAG.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(100));
         }
         info!("received signal, initiating graceful shutdown");
-        poll_running.store(false, Ordering::SeqCst);
+        running.store(false, Ordering::SeqCst);
     });
 }
 
